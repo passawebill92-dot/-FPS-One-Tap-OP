@@ -1,38 +1,41 @@
 --[[
-    MANA MM2 — Murder Mystery 2
+    MANA FPS — [FPS] One Tap
     UI: Obsidian (deividcomsono)
     Key: R/SCRIPTS2026
 
     dump notes (what this is built on):
-      - no anticheat listed.
-      - roles: Remotes.Gameplay.GetCurrentPlayerData (InvokeServer) + PlayerDataChanged / RoundStart (OnClientEvent)
-        give a table keyed by player name: { Role = "Murderer"|"Sheriff"|"Hero"|"Innocent", Dead, Knife, Gun, Perk }
-        the client already receives every role (CurrentRoundClient.GetMurdererPerk scans it).
-      - weapons: Tool tagged "Weapon_Knife" / "Weapon_Gun" (CollectionService, replicated).
-      - coins: <Map>.CoinContainer.Coin_Server parts, attrs CoinID + Collected.
-        CoinCollected(coinId, current, max) -> bag full when max <= current; CoinsStarted resets.
-      - aiming: ClientServices.WeaponService.GetMouseTargetCFrame / GetTargetPosition turn the mouse into the
-        world point weapons aim at. zero callers in the 268 dumped scripts -> their callers are the Gun/Knife
-        tool scripts the dumper skipped. silent aim replaces those two module fields.
-      - emotes: Remotes.Misc.PlayEmote is a BindableEvent. Animate's handler plays any Sync.Emotes key with no
-        ownership check (only the /e chat path checks ProfileData.Emotes.Owned), and Animate loads every emote.
-        your own character's animations replicate, so others see them.
-      - NOT in this dump (verify live): the dropped gun's name ("GunDrop", the long-standing MM2 name) and
-        whether the knife registers firetouchinterest touches (kill aura).
+      - no server anticheat listed. client-only ReplicatedStorage.NewChecker:
+          * deletes BodyVelocity/BodyGyro/Align*/LinearVelocity in the character
+          * zeroes velocity if horizontal speed >= 50
+          * pushes you down after 5s airborne unless character attr "lastJumpBoost" is < 3s old
+          * snaps X/Z tilt back upright
+        -> movement here never uses movers, never touches horizontal velocity, keeps yaw-only rotation,
+           and refreshes lastJumpBoost while airborne
+      - shots: WeaponClient builds the packet client-side and calls useWeapon.send(packet).
+        the dev nil'd WeaponPackets.useWeapon and kept it as an upvalue of the fire closure:
+          WeaponClient.fire -> upvalue v8 -> upvalue useWeapon (packet table with .send/.reader)
+        silent aim swaps that .send field and rewrites hitResult/hitPart/position/direction.
+      - targets: CollectionService tag "Character", R6 rigs, ForceField = spawn protection, FFA (no teams)
 ]]
 
 -- ═══════════════════════════════════════════
 -- PRECONDITIONS
 -- ═══════════════════════════════════════════
 local function need(ok, what)
-    if not ok then error("[MANA MM2] executor is missing: " .. what, 0) end
+    if not ok then error("[MANA FPS] executor is missing: " .. what, 0) end
 end
+
+local getupvalue = debug.getupvalue or getupvalue
+local getupvalues = debug.getupvalues or getupvalues
+
 need(Drawing and Drawing.new, "Drawing library")
 need(loadstring, "loadstring")
+need(getupvalue, "debug.getupvalue")
+need(getupvalues, "debug.getupvalues")
 need(setclipboard, "setclipboard")
 
 local G = getgenv()
-if G.__mana_mm2_unload then pcall(G.__mana_mm2_unload) end
+if G.__rs_onetap_unload then pcall(G.__rs_onetap_unload) end
 
 -- ═══════════════════════════════════════════
 -- SERVICES
@@ -41,12 +44,12 @@ local cloneref = cloneref or function(o) return o end
 local function svc(n) return cloneref(game:GetService(n)) end
 
 local Players = svc("Players")
-local RS = svc("ReplicatedStorage")
 local RunService = svc("RunService")
 local UIS = svc("UserInputService")
 local CollectionService = svc("CollectionService")
 local HttpService = svc("HttpService")
 local TeleportService = svc("TeleportService")
+local Lighting = svc("Lighting")
 local VirtualUser = svc("VirtualUser")
 
 local LP = Players.LocalPlayer
@@ -62,9 +65,8 @@ local REPO = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
 local LIB_SOURCE = game:HttpGet(REPO .. "Library.lua")
 local function newLibrary() return loadstring(LIB_SOURCE)() end
 
-local DEFAULT_WALKSPEED = 16
-local DEFAULT_JUMPPOWER = 50
-local GUN_DROP_NAME = "GunDrop"
+local GAME_DEFAULT_FOV = 70        -- WeaponClient.Init sets FieldOfView = 70
+local JUMP_VELOCITY = 50           -- R6 default JumpPower
 
 -- ═══════════════════════════════════════════
 -- KEY SCREEN
@@ -72,8 +74,8 @@ local GUN_DROP_NAME = "GunDrop"
 do
     local KL = newLibrary()
     local KW = KL:CreateWindow({
-        Title = "MANA MM2",
-        Footer = "Murder Mystery 2  |  key system",
+        Title = "MANA FPS",
+        Footer = "[FPS] One Tap  |  key system",
         NotifySide = "Right",
         ShowCustomCursor = true,
     })
@@ -94,11 +96,12 @@ do
     enter:AddButton({
         Text = "Check Key",
         Func = function()
-            if KL.Options.KeyInput.Value == KEY then
-                KL:Notify({ Title = "MANA MM2", Description = "key accepted. loading...", Time = 2 })
+            local entered = KL.Options.KeyInput.Value
+            if entered == KEY then
+                KL:Notify({ Title = "MANA FPS", Description = "key accepted. loading...", Time = 2 })
                 authed = true
             else
-                KL:Notify({ Title = "MANA MM2", Description = "invalid key", Time = 3 })
+                KL:Notify({ Title = "MANA FPS", Description = "invalid key", Time = 3 })
             end
         end,
     })
@@ -127,27 +130,19 @@ do
 end
 
 -- ═══════════════════════════════════════════
--- GAME REFERENCES
+-- GAME MODULES
 -- ═══════════════════════════════════════════
-local Gameplay = RS:WaitForChild("Remotes"):WaitForChild("Gameplay")
-local WeaponService = require(RS:WaitForChild("ClientServices"):WaitForChild("WeaponService"))
-local Sync = require(RS:WaitForChild("Database"):WaitForChild("Sync"))
-local PlayEmoteEvent = RS.Remotes:WaitForChild("Misc"):WaitForChild("PlayEmote")
+local Start = LP:WaitForChild("PlayerScripts"):WaitForChild("Start")
+local WeaponClient = require(Start:WaitForChild("Game"):WaitForChild("WeaponClient"))
+local DeployClient = require(Start:WaitForChild("Backend"):WaitForChild("DeployClient"))
+local DeathScreen = require(Start.Game:WaitForChild("Interface"):WaitForChild("DeathScreenInterface"))
 
--- ═══════════════════════════════════════════
--- CATALOGS (built from the game's own database)
--- ═══════════════════════════════════════════
-local Emotes = { labels = {}, byLabel = {}, animIds = {} }
-for key, e in pairs(Sync.Emotes) do
-    if e.AnimationID then
-        local label = e.Name or key
-        if Emotes.byLabel[label] then label = ("%s (%s)"):format(label, key) end
-        Emotes.byLabel[label] = key
-        Emotes.labels[#Emotes.labels + 1] = label
-        Emotes.animIds[tonumber(e.AnimationID)] = true
-    end
-end
-table.sort(Emotes.labels)
+-- filled once the server hands WeaponClient its key (v8 exists)
+local Hook = {
+    useWeapon = nil,      -- packet table
+    origSend = nil,
+    WeaponManager = nil,  -- the game's own instance, taken from v8's upvalues
+}
 
 -- ═══════════════════════════════════════════
 -- STATE
@@ -160,10 +155,6 @@ local function bind(signal, fn)
     return c
 end
 
-local PlayerData = {}       -- [playerName] = { Role, Dead, Knife, Gun, Perk }
-local BagFull = {}          -- [coinId] = true once that bag is full
-local forceSilent = false   -- set by the Shoot Murderer button for one shot
-
 -- ═══════════════════════════════════════════
 -- UI
 -- ═══════════════════════════════════════════
@@ -172,118 +163,168 @@ local ThemeManager = loadstring(game:HttpGet(REPO .. "addons/ThemeManager.lua"))
 local SaveManager = loadstring(game:HttpGet(REPO .. "addons/SaveManager.lua"))()
 local Options, Toggles = Library.Options, Library.Toggles
 
+-- ═══════════════════════════════════════════
+-- WEAPON MODS
+-- defined before the UI: slider/toggle callbacks can fire during construction.
+-- no-op until the shot hook hands us the game's own WeaponManager.
+-- ═══════════════════════════════════════════
+local NIL = {}
+local Originals = {} -- [table] = { [key] = original or NIL }
+
+local function setField(t, k, v)
+    Originals[t] = Originals[t] or {}
+    if Originals[t][k] == nil then
+        local cur = rawget(t, k)
+        Originals[t][k] = cur == nil and NIL or cur
+    end
+    rawset(t, k, v)
+end
+
+local function restoreField(t, k)
+    local saved = Originals[t] and Originals[t][k]
+    if saved == nil then return end
+    if saved == NIL then rawset(t, k, nil) else rawset(t, k, saved) end
+    Originals[t][k] = nil
+end
+
+local function restoreAllFields()
+    for t, fields in pairs(Originals) do
+        for k in pairs(fields) do restoreField(t, k) end
+    end
+end
+
+local function applyWeaponMods()
+    local WM = Hook.WeaponManager
+    if not WM then return end
+
+    local weapons = WM.getWeapons()
+    local function perWeapon(enabled, key, value)
+        for _, data in pairs(weapons) do
+            if enabled then setField(data, key, value) else restoreField(data, key) end
+        end
+    end
+
+    perWeapon(Toggles.FastReload.Value, "reloadTime", Options.ReloadTime.Value)
+
+    local C = WM.Constants
+    if Toggles.FastBullets.Value then setField(C, "DEFAULT_SPEED", 50000) else restoreField(C, "DEFAULT_SPEED") end
+    if Toggles.LongRange.Value then setField(C, "DEFAULT_MAX_DISTANCE", 5000) else restoreField(C, "DEFAULT_MAX_DISTANCE") end
+end
+
 local Window = Library:CreateWindow({
-    Title = "MANA MM2",
-    Footer = "Murder Mystery 2  |  v1.0",
+    Title = "MANA FPS",
+    Footer = "[FPS] One Tap  |  v1.0",
     NotifySide = "Right",
     ShowCustomCursor = true,
 })
 
 local Tabs = {
-    Main = Window:AddTab("Main", "crosshair"),
+    Combat = Window:AddTab("Combat", "crosshair"),
     Visuals = Window:AddTab("Visuals", "eye"),
-    Farm = Window:AddTab("Farm", "coins"),
-    Emotes = Window:AddTab("Emotes", "smile"),
-    Player = Window:AddTab("Player", "user"),
+    Weapon = Window:AddTab("Weapon", "zap"),
+    Movement = Window:AddTab("Movement", "move"),
     Misc = Window:AddTab("Misc", "box"),
     ["UI Settings"] = Window:AddTab("UI Settings", "settings"),
 }
 
-local shootMurderer, grabGun, playSelectedEmote, stopEmotes -- defined below, used by buttons
-
--- ── MAIN ───────────────────────────────────
-local hookStatus, roleLabel
+-- ── COMBAT ─────────────────────────────────
 do
-    local aim = Tabs.Main:AddLeftGroupbox("Silent Aim", "target")
-    aim:AddToggle("SilentAim", { Text = "Silent Aim", Default = false,
-        Tooltip = "sheriff/hero: shots go to the murderer. murderer: throws go to the closest player to your mouse." })
-    aim:AddSlider("Prediction", { Text = "Prediction (ms)", Default = 120, Min = 0, Max = 400, Rounding = 0 })
-    aim:AddDivider()
-    aim:AddButton({ Text = "Shoot Murderer", Func = function() shootMurderer() end })
-    aim:AddLabel("Shoot keybind"):AddKeyPicker("ShootKey", { Default = "Q", Mode = "Toggle", Text = "Shoot Murderer", NoUI = false,
-        Callback = function() shootMurderer() end })
+    local silent = Tabs.Combat:AddLeftGroupbox("Silent Aim", "target")
+    silent:AddToggle("SilentAim", { Text = "Silent Aim", Default = false, Tooltip = "rewrites the shot packet onto the target" })
+    silent:AddSlider("SilentFOV", { Text = "FOV Radius", Default = 150, Min = 10, Max = 800, Rounding = 0 })
+    silent:AddSlider("HitChance", { Text = "Hit Chance %", Default = 100, Min = 1, Max = 100, Rounding = 0 })
+    silent:AddDropdown("SilentPart", { Text = "Target Part", Values = { "Head", "Torso", "Closest" }, Default = 1 })
+    silent:AddToggle("SilentWallCheck", { Text = "Wall Check", Default = true })
+    silent:AddToggle("ShowSilentFOV", { Text = "Show FOV", Default = false })
+        :AddColorPicker("SilentFOVColor", { Default = Color3.fromRGB(255, 255, 255), Title = "Silent FOV" })
 
-    local knife = Tabs.Main:AddLeftGroupbox("Murderer", "sword")
-    knife:AddToggle("KillAura", { Text = "Knife Aura", Default = false, Risky = true,
-        Tooltip = "stabs anyone in range while you hold the knife (needs firetouchinterest)" })
-    knife:AddSlider("AuraRange", { Text = "Range", Default = 12, Min = 4, Max = 25, Rounding = 0 })
+    local auto = Tabs.Combat:AddLeftGroupbox("Auto Shoot", "flame")
+    auto:AddToggle("AutoShoot", { Text = "Auto Shoot", Default = false, Risky = true,
+        Tooltip = "fires when a visible target is inside the silent aim FOV (needs Silent Aim on)" })
 
-    local gun = Tabs.Main:AddRightGroupbox("Gun", "hand")
-    gun:AddToggle("AutoGrabGun", { Text = "Auto Grab Dropped Gun", Default = false,
-        Tooltip = "teleports to the dropped gun and back. never as murderer." })
-    gun:AddButton({ Text = "Grab Gun Now", Func = function() grabGun() end })
+    local aim = Tabs.Combat:AddRightGroupbox("Aimbot", "crosshair")
+    aim:AddToggle("Aimbot", { Text = "Aimbot", Default = false })
+        :AddKeyPicker("AimKey", { Default = "MB2", Mode = "Hold", Text = "Aimbot", SyncToggleState = false })
+    aim:AddSlider("AimFOV", { Text = "FOV Radius", Default = 120, Min = 10, Max = 800, Rounding = 0 })
+    aim:AddSlider("AimSmooth", { Text = "Smoothing", Default = 4, Min = 1, Max = 20, Rounding = 1 })
+    aim:AddDropdown("AimPart", { Text = "Target Part", Values = { "Head", "Torso", "Closest" }, Default = 1 })
+    aim:AddToggle("AimWallCheck", { Text = "Wall Check", Default = true })
+    aim:AddToggle("AimPrediction", { Text = "Bullet Prediction", Default = true,
+        Tooltip = "leads moving targets by bullet travel time" })
+    aim:AddToggle("ShowAimFOV", { Text = "Show FOV", Default = false })
+        :AddColorPicker("AimFOVColor", { Default = Color3.fromRGB(255, 80, 80), Title = "Aimbot FOV" })
 
-    local info = Tabs.Main:AddRightGroupbox("Round", "info")
-    roleLabel = info:AddLabel("murderer: ?\nsheriff: ?", true)
-    info:AddToggle("RoleNotify", { Text = "Notify Roles", Default = true, Tooltip = "popup with murderer + sheriff each round" })
-    hookStatus = info:AddLabel("", true)
+    local trig = Tabs.Combat:AddRightGroupbox("Triggerbot", "mouse-pointer-click")
+    trig:AddToggle("Triggerbot", { Text = "Triggerbot", Default = false })
+        :AddKeyPicker("TriggerKey", { Default = "T", Mode = "Toggle", Text = "Triggerbot", SyncToggleState = true })
+    trig:AddSlider("TriggerDelay", { Text = "Delay (ms)", Default = 40, Min = 0, Max = 300, Rounding = 0 })
 end
 
 -- ── VISUALS ────────────────────────────────
 do
-    local esp = Tabs.Visuals:AddLeftGroupbox("Role ESP", "scan-eye")
+    local esp = Tabs.Visuals:AddLeftGroupbox("ESP", "scan-eye")
     esp:AddToggle("ESPEnabled", { Text = "Enabled", Default = false })
-    esp:AddToggle("ESPChams", { Text = "Chams", Default = true })
-    esp:AddToggle("ESPNames", { Text = "Name + Role", Default = true })
+    esp:AddToggle("ESPBox", { Text = "Box", Default = true })
+        :AddColorPicker("BoxColor", { Default = Color3.fromRGB(255, 255, 255), Title = "Box" })
+    esp:AddDropdown("BoxStyle", { Text = "Box Style", Values = { "Corner", "Full" }, Default = 1 })
+    esp:AddToggle("ESPName", { Text = "Name", Default = true })
     esp:AddToggle("ESPDistance", { Text = "Distance", Default = true })
-    esp:AddToggle("ESPTracers", { Text = "Tracers", Default = false })
-    esp:AddToggle("ESPInnocents", { Text = "Show Innocents", Default = true })
+    esp:AddToggle("ESPWeapon", { Text = "Weapon", Default = true })
+    esp:AddToggle("ESPHealth", { Text = "Health Bar", Default = true })
+    esp:AddToggle("ESPTracer", { Text = "Tracer", Default = false })
+        :AddColorPicker("TracerColor", { Default = Color3.fromRGB(255, 80, 80), Title = "Tracer" })
+    esp:AddDropdown("TracerOrigin", { Text = "Tracer Origin", Values = { "Bottom", "Center", "Mouse" }, Default = 1 })
+    esp:AddToggle("ESPSkeleton", { Text = "Skeleton", Default = false })
+        :AddColorPicker("SkeletonColor", { Default = Color3.fromRGB(255, 255, 255), Title = "Skeleton" })
+    esp:AddToggle("ESPVisibleColor", { Text = "Visible Color", Default = true, Tooltip = "recolor box when not behind a wall" })
+        :AddColorPicker("VisibleColor", { Default = Color3.fromRGB(80, 255, 120), Title = "Visible" })
+    esp:AddSlider("ESPMaxDist", { Text = "Max Distance", Default = 1500, Min = 100, Max = 5000, Rounding = 0 })
 
-    local colors = Tabs.Visuals:AddRightGroupbox("Colors", "palette")
-    colors:AddLabel("Murderer"):AddColorPicker("ColMurderer", { Default = Color3.fromRGB(255, 50, 50), Title = "Murderer" })
-    colors:AddLabel("Sheriff"):AddColorPicker("ColSheriff", { Default = Color3.fromRGB(60, 140, 255), Title = "Sheriff" })
-    colors:AddLabel("Hero"):AddColorPicker("ColHero", { Default = Color3.fromRGB(255, 210, 60), Title = "Hero" })
-    colors:AddLabel("Innocent"):AddColorPicker("ColInnocent", { Default = Color3.fromRGB(80, 230, 120), Title = "Innocent" })
-    colors:AddLabel("Dropped Gun"):AddColorPicker("ColGun", { Default = Color3.fromRGB(255, 255, 255), Title = "Dropped Gun" })
+    local chams = Tabs.Visuals:AddRightGroupbox("Chams", "sparkles")
+    chams:AddToggle("Chams", { Text = "Chams", Default = false })
+        :AddColorPicker("ChamsFill", { Default = Color3.fromRGB(255, 60, 60), Title = "Fill" })
+        :AddColorPicker("ChamsOutline", { Default = Color3.fromRGB(255, 255, 255), Title = "Outline" })
+    chams:AddSlider("ChamsFillTrans", { Text = "Fill Transparency", Default = 50, Min = 0, Max = 100, Rounding = 0 })
 
-    local gunEsp = Tabs.Visuals:AddRightGroupbox("Dropped Gun", "crosshair")
-    gunEsp:AddToggle("GunESP", { Text = "Dropped Gun ESP", Default = true })
+    local world = Tabs.Visuals:AddRightGroupbox("World", "sun")
+    world:AddToggle("Fullbright", { Text = "Fullbright", Default = false })
+    world:AddToggle("FOVChanger", { Text = "FOV Changer", Default = false })
+    world:AddSlider("FOVValue", { Text = "Field of View", Default = 90, Min = 70, Max = 120, Rounding = 0 })
 end
 
--- ── FARM ───────────────────────────────────
+-- ── WEAPON ─────────────────────────────────
 do
-    local farm = Tabs.Farm:AddLeftGroupbox("Coin Farm", "coins")
-    farm:AddToggle("CoinFarm", { Text = "Auto Farm Coins", Default = false,
-        Tooltip = "flies coin to coin until your bag is full" })
-    farm:AddSlider("FarmSpeed", { Text = "Speed (studs/s)", Default = 25, Min = 10, Max = 60, Rounding = 0 })
-    farm:AddToggle("AvoidMurderer", { Text = "Avoid Murderer", Default = true })
-    farm:AddSlider("AvoidRadius", { Text = "Avoid Radius", Default = 25, Min = 10, Max = 80, Rounding = 0 })
-    farm:AddLabel("high speeds are the easiest thing for the server to flag. 25 is a safe pace.", true)
+    local mods = Tabs.Weapon:AddLeftGroupbox("Gun Mods", "wrench")
+    mods:AddLabel("edits the game's weapon data client-side. fast reload may be rejected if the server times reloads.", true)
+    mods:AddToggle("FastReload", { Text = "Fast Reload", Default = false, Risky = true, Callback = function() applyWeaponMods() end })
+    mods:AddSlider("ReloadTime", { Text = "Reload Time (s)", Default = 0.1, Min = 0.05, Max = 0.75, Rounding = 2, Callback = function() applyWeaponMods() end })
+    mods:AddToggle("FastBullets", { Text = "Instant Bullets", Default = false, Tooltip = "bullet speed 3850 -> 50000", Callback = function() applyWeaponMods() end })
+    mods:AddToggle("LongRange", { Text = "Long Range", Default = false, Tooltip = "max distance 1500 -> 5000", Callback = function() applyWeaponMods() end })
 end
 
--- ── EMOTES ─────────────────────────────────
+-- ── MOVEMENT ───────────────────────────────
 do
-    local em = Tabs.Emotes:AddLeftGroupbox("All Emotes", "smile")
-    em:AddLabel(("%d emotes, all unlocked. other players see them."):format(#Emotes.labels), true)
-    em:AddDropdown("EmotePick", { Text = "Emote", Values = Emotes.labels, Default = 1, Searchable = true })
-    em:AddButton({ Text = "Play", Func = function() playSelectedEmote() end })
-    em:AddButton({ Text = "Stop", Func = function() stopEmotes() end })
-    em:AddLabel("Play keybind"):AddKeyPicker("EmoteKey", { Default = "G", Mode = "Toggle", Text = "Play Emote", NoUI = false,
-        Callback = function() playSelectedEmote() end })
-
-    local quick = Tabs.Emotes:AddRightGroupbox("Quick Play", "zap")
-    quick:AddLabel("stand still: the game only starts emotes while you're standing.", true)
-    quick:AddButton({ Text = "Random Emote", Func = function()
-        Options.EmotePick:SetValue(Emotes.labels[math.random(#Emotes.labels)])
-        playSelectedEmote()
-    end })
-end
-
--- ── PLAYER ─────────────────────────────────
-do
-    local mv = Tabs.Player:AddLeftGroupbox("Movement", "footprints")
-    mv:AddToggle("Speed", { Text = "Walk Speed", Default = false })
-    mv:AddSlider("SpeedValue", { Text = "Speed", Default = 24, Min = 16, Max = 60, Rounding = 0 })
-    mv:AddToggle("Jump", { Text = "Jump Power", Default = false })
-    mv:AddSlider("JumpValue", { Text = "Power", Default = 65, Min = 50, Max = 150, Rounding = 0 })
+    local mv = Tabs.Movement:AddLeftGroupbox("Movement", "footprints")
+    mv:AddToggle("Speed", { Text = "Speed", Default = false })
+    mv:AddSlider("SpeedValue", { Text = "Walk Speed", Default = 34, Min = 16, Max = 60, Rounding = 0 })
+    mv:AddToggle("Fly", { Text = "Fly", Default = false })
+        :AddKeyPicker("FlyKey", { Default = "F", Mode = "Toggle", Text = "Fly", SyncToggleState = true })
+    mv:AddSlider("FlySpeed", { Text = "Fly Speed", Default = 60, Min = 10, Max = 150, Rounding = 0 })
     mv:AddToggle("InfJump", { Text = "Infinite Jump", Default = false })
+    mv:AddToggle("Bhop", { Text = "Bunny Hop", Default = false, Tooltip = "hold space" })
     mv:AddToggle("Noclip", { Text = "Noclip", Default = false })
 end
 
 -- ── MISC ───────────────────────────────────
+local hookStatus
 do
-    local util = Tabs.Misc:AddLeftGroupbox("Utility", "wrench")
-    util:AddToggle("AntiAFK", { Text = "Anti AFK", Default = true })
+    local auto = Tabs.Misc:AddLeftGroupbox("Automation", "bot")
+    auto:AddToggle("AutoDeploy", { Text = "Auto Deploy", Default = false })
+    auto:AddToggle("AutoRespawn", { Text = "Auto Respawn", Default = false })
+    auto:AddToggle("AntiAFK", { Text = "Anti AFK", Default = true })
+
+    local status = Tabs.Misc:AddLeftGroupbox("Status", "activity")
+    hookStatus = status:AddLabel("shot hook: waiting for first deploy. if this never changes after you deploy, your executor's require returns a copy of the game module and silent aim / gun mods can't attach.", true)
 
     local server = Tabs.Misc:AddRightGroupbox("Server", "server")
     server:AddButton({ Text = "Rejoin", Func = function()
@@ -302,7 +343,7 @@ do
     end })
     server:AddButton({ Text = "Copy Job ID", Func = function()
         setclipboard(game.JobId)
-        Library:Notify({ Title = "MANA MM2", Description = "job id copied", Time = 2 })
+        Library:Notify({ Title = "MANA FPS", Description = "job id copied", Time = 2 })
     end })
 end
 
@@ -322,480 +363,581 @@ do
 end
 
 -- ═══════════════════════════════════════════
--- ROLES
+-- TARGETING
 -- ═══════════════════════════════════════════
-local function findTool(holder, tag)
-    if not holder then return nil end
-    for _, t in ipairs(holder:GetChildren()) do
-        if t:IsA("Tool") and CollectionService:HasTag(t, tag) then return t end
+local function aliveHumanoid(char)
+    local h = char:FindFirstChildOfClass("Humanoid")
+    return h and h.Health > 0 and h or nil
+end
+
+local function getTargets()
+    local out = {}
+    local me = LP.Character
+    for _, char in ipairs(CollectionService:GetTagged("Character")) do
+        if char ~= me and char.Parent and aliveHumanoid(char) and not char:FindFirstChildOfClass("ForceField") then
+            out[#out + 1] = char
+        end
     end
-    return nil
+    return out
 end
 
--- own tools: character + backpack. other players: only the equipped tool replicates.
-local function ownTool(tag)
-    return findTool(LP.Character, tag) or findTool(LP:FindFirstChildOfClass("Backpack"), tag)
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function setRayIgnore(cam)
+    local ignore = { cam }
+    if LP.Character then ignore[#ignore + 1] = LP.Character end
+    local fx = workspace:FindFirstChild("Effects")
+    if fx then ignore[#ignore + 1] = fx end
+    rayParams.FilterDescendantsInstances = ignore
 end
 
-local function getRole(plr)
-    local d = PlayerData[plr.Name]
-    local role = d and not d.Dead and d.Role or nil
-    -- picked-up gun shows on the character before the data table catches up
-    if role == "Innocent" and findTool(plr.Character, "Weapon_Gun") then role = "Hero" end
-    if plr == LP then
-        if ownTool("Weapon_Knife") then role = "Murderer" end
-        if role ~= "Murderer" and ownTool("Weapon_Gun") and role ~= "Sheriff" then role = "Hero" end
+local function isVisible(part, char, cam)
+    setRayIgnore(cam)
+    local origin = cam.CFrame.Position
+    local hit = workspace:Raycast(origin, part.Position - origin, rayParams)
+    return hit == nil or hit.Instance:IsDescendantOf(char)
+end
+
+local function pickPart(char, mode, center, cam)
+    if mode ~= "Closest" then return char:FindFirstChild(mode) end
+    local best, bestD
+    for _, name in ipairs({ "Head", "Torso" }) do
+        local p = char:FindFirstChild(name)
+        if p then
+            local sp = cam:WorldToViewportPoint(p.Position)
+            if sp.Z > 0 then
+                local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                if not bestD or d < bestD then best, bestD = p, d end
+            end
+        end
     end
-    return role
+    return best
 end
 
-local function findByRole(role)
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if getRole(plr) == role then return plr end
-    end
-    return nil
-end
-
-local function rootOf(plr)
-    local char = plr and plr.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if not (hum and hum.Health > 0) then return nil end
-    return char:FindFirstChild("HumanoidRootPart")
-end
-
-local lastAnnounced = nil
-local function onDataUpdated()
-    local murderer = findByRole("Murderer")
-    local sheriff = findByRole("Sheriff") or findByRole("Hero")
-    roleLabel:SetText(("murderer: %s\nsheriff: %s"):format(
-        murderer and murderer.DisplayName or "?", sheriff and sheriff.DisplayName or "?"))
-
-    if Toggles.RoleNotify.Value and murderer and murderer.Name ~= lastAnnounced then
-        lastAnnounced = murderer.Name
-        Library:Notify({
-            Title = "Roles",
-            Description = ("Murderer: %s\nSheriff: %s"):format(murderer.DisplayName, sheriff and sheriff.DisplayName or "?"),
-            Time = 6,
-        })
-    end
-end
-
-local function setPlayerData(d)
-    if type(d) == "table" then PlayerData = d end
-    onDataUpdated()
-end
-
-bind(Gameplay:WaitForChild("PlayerDataChanged").OnClientEvent, setPlayerData)
-bind(Gameplay:WaitForChild("RoundStart").OnClientEvent, function(_, data)
-    lastAnnounced = nil
-    setPlayerData(data)
-end)
-task.spawn(function()
-    setPlayerData(Gameplay:WaitForChild("GetCurrentPlayerData"):InvokeServer())
-end)
-
--- ═══════════════════════════════════════════
--- SILENT AIM (WeaponService field swap)
--- ═══════════════════════════════════════════
-local origGetMouseTargetCFrame = WeaponService.GetMouseTargetCFrame
-local origGetTargetPosition = WeaponService.GetTargetPosition
-
-local function predicted(root)
-    return root.Position + root.AssemblyLinearVelocity * (Options.Prediction.Value / 1000)
-end
-
-local function closestToMouse()
+local function getTarget(fov, mode, wallCheck)
     local cam = workspace.CurrentCamera
-    local mouse = UIS:GetMouseLocation()
-    local best, bestD
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LP then
-            local root = rootOf(plr)
-            if root then
-                local sp, onScreen = cam:WorldToViewportPoint(root.Position)
-                if onScreen then
-                    local d = (Vector2.new(sp.X, sp.Y) - mouse).Magnitude
-                    if not bestD or d < bestD then best, bestD = root, d end
+    local vp = cam.ViewportSize
+    local center = Vector2.new(vp.X / 2, vp.Y / 2)
+    local bestChar, bestPart, bestD = nil, nil, fov
+    for _, char in ipairs(getTargets()) do
+        local part = pickPart(char, mode, center, cam)
+        if part then
+            local sp = cam:WorldToViewportPoint(part.Position)
+            if sp.Z > 0 then
+                local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                if d <= bestD and (not wallCheck or isVisible(part, char, cam)) then
+                    bestChar, bestPart, bestD = char, part, d
                 end
             end
         end
     end
-    return best
-end
-
-local function silentAimPoint()
-    if not (Toggles.SilentAim.Value or forceSilent) then return nil end
-    if getRole(LP) == "Murderer" then
-        local root = closestToMouse()
-        return root and predicted(root)
-    end
-    local root = rootOf(findByRole("Murderer"))
-    return root and predicted(root)
-end
-
-WeaponService.GetMouseTargetCFrame = function(self, ...)
-    if Running then
-        local p = silentAimPoint()
-        if p then return CFrame.new(p) end
-    end
-    return origGetMouseTargetCFrame(self, ...)
-end
-
-WeaponService.GetTargetPosition = function(self, ...)
-    if Running then
-        local p = silentAimPoint()
-        if p then return CFrame.new(p) end
-    end
-    return origGetTargetPosition(self, ...)
-end
-
-function shootMurderer()
-    local gun = ownTool("Weapon_Gun")
-    if not gun then
-        Library:Notify({ Title = "MANA MM2", Description = "you don't have the gun", Time = 2 })
-        return
-    end
-    if not rootOf(findByRole("Murderer")) then
-        Library:Notify({ Title = "MANA MM2", Description = "murderer not found yet", Time = 2 })
-        return
-    end
-    local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-    if not hum then return end
-    if gun.Parent ~= LP.Character then
-        hum:EquipTool(gun)
-        task.wait(0.15)
-    end
-    forceSilent = true
-    gun:Activate()
-    task.delay(0.4, function() forceSilent = false end)
+    return bestChar, bestPart
 end
 
 -- ═══════════════════════════════════════════
--- KNIFE AURA
+-- SHOT HOOK (useWeapon.send swap)
 -- ═══════════════════════════════════════════
-local lastStab = 0
-local function updateKillAura()
-    if not Toggles.KillAura.Value then return end
-    if not firetouchinterest then return end
-    local knife = findTool(LP.Character, "Weapon_Knife")
-    local handle = knife and knife:FindFirstChild("Handle")
-    local myRoot = rootOf(LP)
-    if not (handle and myRoot) then return end
-    if os.clock() - lastStab < 0.25 then return end
-
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LP then
-            local root = rootOf(plr)
-            if root and (root.Position - myRoot.Position).Magnitude <= Options.AuraRange.Value then
-                lastStab = os.clock()
-                knife:Activate()
-                firetouchinterest(handle, root, 0)
-                firetouchinterest(handle, root, 1)
-                return
-            end
+local function rewriteShot(pkt)
+    if Toggles.SilentAim.Value and pkt.weaponType ~= "Knife" and math.random(1, 100) <= Options.HitChance.Value then
+        local char, part = getTarget(Options.SilentFOV.Value, Options.SilentPart.Value, Toggles.SilentWallCheck.Value)
+        if part then
+            pkt.hitResult = char
+            pkt.hitPart = part
+            pkt.position = part.Position
+            pkt.direction = (part.Position - pkt.origin).Unit
         end
     end
 end
 
--- ═══════════════════════════════════════════
--- DROPPED GUN
--- ═══════════════════════════════════════════
-local function findGunDrop()
-    local d = workspace:FindFirstChild(GUN_DROP_NAME, true)
-    return d and d:IsA("BasePart") and d or nil
-end
-
-local grabbing = false
-function grabGun()
-    if grabbing then return end
-    local drop = findGunDrop()
-    local myRoot = rootOf(LP)
-    if not (drop and myRoot) then
-        Library:Notify({ Title = "MANA MM2", Description = "no dropped gun right now", Time = 2 })
-        return
+local function locateGameInternals()
+    local fireImpl = getupvalue(WeaponClient.fire, 1)
+    if type(fireImpl) ~= "function" then return false end
+    for _, v in pairs(getupvalues(fireImpl)) do
+        if type(v) == "table" then
+            if type(rawget(v, "send")) == "function" and rawget(v, "reader") ~= nil then
+                Hook.useWeapon = v
+            elseif type(rawget(v, "Constants")) == "table" and type(rawget(v, "getWeaponData")) == "function" then
+                Hook.WeaponManager = v
+            end
+        end
     end
-    if getRole(LP) == "Murderer" then return end
-    grabbing = true
-    local back = myRoot.CFrame
-    myRoot.CFrame = drop.CFrame
-    task.wait(0.3)
-    if rootOf(LP) == myRoot then myRoot.CFrame = back end
-    grabbing = false
+    return Hook.useWeapon ~= nil and Hook.WeaponManager ~= nil
 end
 
 task.spawn(function()
-    while Running do
-        if Toggles.AutoGrabGun.Value and not grabbing and findGunDrop()
-            and getRole(LP) ~= "Murderer" and not ownTool("Weapon_Gun") and rootOf(LP) then
-            grabGun()
+    while Running and not locateGameInternals() do task.wait(0.5) end
+    if not Running then return end
+
+    Hook.origSend = Hook.useWeapon.send
+    Hook.useWeapon.send = function(pkt)
+        if Running then
+            local ok, err = pcall(rewriteShot, pkt)
+            if not ok then warn("[MANA FPS] shot rewrite: " .. tostring(err)) end
         end
-        task.wait(0.5)
+        return Hook.origSend(pkt)
     end
+
+    applyWeaponMods()
+    hookStatus:SetText("shot hook: ready")
+    Library:Notify({ Title = "MANA FPS", Description = "shot hook ready. silent aim + gun mods live.", Time = 3 })
 end)
 
 -- ═══════════════════════════════════════════
--- EMOTES
+-- DRAWINGS
 -- ═══════════════════════════════════════════
-function playSelectedEmote()
-    local key = Emotes.byLabel[Options.EmotePick.Value]
-    if key then PlayEmoteEvent:Fire(key) end
+local function newDrawing(kind, props)
+    local d = Drawing.new(kind)
+    for k, v in pairs(props) do d[k] = v end
+    return d
 end
 
-function stopEmotes()
-    local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-    local animator = hum and hum:FindFirstChildOfClass("Animator")
-    if not animator then return end
-    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-        local id = tonumber(tostring(track.Animation and track.Animation.AnimationId or ""):match("(%d+)$"))
-        if id and Emotes.animIds[id] then track:Stop(0.2) end
-    end
-end
+local silentCircle = newDrawing("Circle", { Thickness = 1, NumSides = 64, Filled = false, Visible = false, Transparency = 1 })
+local aimCircle = newDrawing("Circle", { Thickness = 1, NumSides = 64, Filled = false, Visible = false, Transparency = 1 })
 
--- ═══════════════════════════════════════════
--- COIN FARM
--- ═══════════════════════════════════════════
-bind(Gameplay:WaitForChild("CoinCollected").OnClientEvent, function(coinId, current, max)
-    if type(current) == "number" and type(max) == "number" and max <= current then
-        BagFull[coinId] = true
-    end
-end)
-bind(Gameplay:WaitForChild("CoinsStarted").OnClientEvent, function() table.clear(BagFull) end)
+local ESP = {} -- [char] = objects
 
-local skipped = {}   -- coins we reached that never registered
-local farmTarget, farmArrived = nil, nil
-
-local function nextCoin(myRoot)
-    local murderer = Toggles.AvoidMurderer.Value and rootOf(findByRole("Murderer"))
-    local best, bestD
-    for _, map in ipairs(workspace:GetChildren()) do
-        local container = map:FindFirstChild("CoinContainer")
-        if container then
-            for _, coin in ipairs(container:GetChildren()) do
-                if coin.Name == "Coin_Server" and coin:IsA("BasePart") and not coin:GetAttribute("Collected")
-                    and not skipped[coin] and not BagFull[coin:GetAttribute("CoinID")]
-                    and not (murderer and (coin.Position - murderer.Position).Magnitude < Options.AvoidRadius.Value) then
-                    local d = (coin.Position - myRoot.Position).Magnitude
-                    if not bestD or d < bestD then best, bestD = coin, d end
-                end
-            end
-        end
-    end
-    return best
-end
-
-local function updateCoinFarm(dt)
-    if not Toggles.CoinFarm.Value then
-        farmTarget = nil
-        return
-    end
-    local myData = PlayerData[LP.Name]
-    local myRoot = rootOf(LP)
-    if not (myRoot and myData and not myData.Dead) then
-        farmTarget = nil
-        return
-    end
-
-    if not farmTarget or not farmTarget.Parent or farmTarget:GetAttribute("Collected") then
-        farmTarget = nextCoin(myRoot)
-        farmArrived = nil
-        if not farmTarget then return end
-    end
-
-    local goal = farmTarget.Position
-    local delta = goal - myRoot.Position
-    local step = Options.FarmSpeed.Value * dt
-    myRoot.AssemblyLinearVelocity = Vector3.zero
-    if delta.Magnitude <= step then
-        myRoot.CFrame = CFrame.new(goal)
-        farmArrived = farmArrived or os.clock()
-        -- sat on it a full second and the server never marked it: skip it
-        if os.clock() - farmArrived > 1 then
-            skipped[farmTarget] = true
-            farmTarget = nil
-        end
-    else
-        myRoot.CFrame = CFrame.new(myRoot.Position + delta.Unit * step)
-    end
-end
-
-bind(Gameplay:WaitForChild("CoinsStarted").OnClientEvent, function() table.clear(skipped) end)
-
--- ═══════════════════════════════════════════
--- ESP
--- ═══════════════════════════════════════════
-local espFolder = Instance.new("Folder")
-espFolder.Name = HttpService:GenerateGUID(false)
-espFolder.Parent = gethui and gethui() or svc("CoreGui")
-
-local ESP = {} -- [player] = { hl, name, tracer }
-
-local function roleColor(role)
-    if role == "Murderer" then return Options.ColMurderer.Value end
-    if role == "Sheriff" then return Options.ColSheriff.Value end
-    if role == "Hero" then return Options.ColHero.Value end
-    return Options.ColInnocent.Value
-end
-
-local function getESP(plr)
-    local o = ESP[plr]
-    if o then return o end
-    o = {
-        hl = Instance.new("Highlight"),
-        name = Drawing.new("Text"),
-        tracer = Drawing.new("Line"),
-    }
-    o.hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    o.hl.FillTransparency = 0.55
-    o.hl.OutlineTransparency = 0
-    o.hl.Enabled = false
-    o.hl.Parent = espFolder
-    o.name.Size = 14
-    o.name.Center = true
-    o.name.Outline = true
-    o.name.Font = 2
-    o.name.Visible = false
-    o.tracer.Thickness = 1
-    o.tracer.Visible = false
-    ESP[plr] = o
+local function createESP()
+    local o = { box = {}, skel = {} }
+    for i = 1, 8 do o.box[i] = newDrawing("Line", { Thickness = 1, Visible = false }) end
+    for i = 1, 6 do o.skel[i] = newDrawing("Line", { Thickness = 1, Visible = false }) end
+    o.name = newDrawing("Text", { Size = 13, Center = true, Outline = true, Font = 2, Visible = false, Color = Color3.new(1, 1, 1) })
+    o.info = newDrawing("Text", { Size = 12, Center = true, Outline = true, Font = 2, Visible = false, Color = Color3.fromRGB(200, 200, 200) })
+    o.hpBack = newDrawing("Line", { Thickness = 4, Visible = false, Color = Color3.new(0, 0, 0) })
+    o.hpFill = newDrawing("Line", { Thickness = 2, Visible = false })
+    o.tracer = newDrawing("Line", { Thickness = 1, Visible = false })
     return o
 end
 
-local function removeESP(plr)
-    local o = ESP[plr]
-    if not o then return end
-    o.hl:Destroy()
-    o.name:Remove()
-    o.tracer:Remove()
-    ESP[plr] = nil
+local function hideESP(o)
+    for _, l in ipairs(o.box) do l.Visible = false end
+    for _, l in ipairs(o.skel) do l.Visible = false end
+    o.name.Visible = false
+    o.info.Visible = false
+    o.hpBack.Visible = false
+    o.hpFill.Visible = false
+    o.tracer.Visible = false
 end
 
-local gunHL = Instance.new("Highlight")
-gunHL.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-gunHL.FillTransparency = 0.3
-gunHL.Enabled = false
-gunHL.Parent = espFolder
-local gunText = Drawing.new("Text")
-gunText.Size = 14
-gunText.Center = true
-gunText.Outline = true
-gunText.Font = 2
-gunText.Text = "DROPPED GUN"
-gunText.Visible = false
+local function removeESP(o)
+    for _, l in ipairs(o.box) do l:Remove() end
+    for _, l in ipairs(o.skel) do l:Remove() end
+    o.name:Remove()
+    o.info:Remove()
+    o.hpBack:Remove()
+    o.hpFill:Remove()
+    o.tracer:Remove()
+end
 
-local function updateESP()
-    local cam = workspace.CurrentCamera
+local function line(l, a, b, color)
+    l.From = a
+    l.To = b
+    l.Color = color
+    l.Visible = true
+end
+
+local function heldWeaponName(char)
+    local slot = char:GetAttribute("currentWeaponServer") or "Primary"
+    if slot == "Primary" then return char:GetAttribute("primaryWeapon") or "Primary" end
+    if slot == "Secondary" then return char:GetAttribute("secondaryWeapon") or "Secondary" end
+    return char:GetAttribute("knifeName") or "Knife"
+end
+
+-- chams live outside the character so the game never sees them
+local chamsFolder = Instance.new("Folder")
+chamsFolder.Name = HttpService:GenerateGUID(false)
+chamsFolder.Parent = gethui and gethui() or svc("CoreGui")
+local Chams = {} -- [char] = Highlight
+
+local function updateESP(cam)
     local vp = cam.ViewportSize
-    local myRoot = rootOf(LP)
+    local myRoot = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    local seen = {}
 
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LP then
-            local o = getESP(plr)
-            local root = rootOf(plr)
-            local role = root and getRole(plr)
-            local show = Toggles.ESPEnabled.Value and root ~= nil and role ~= nil
-                and (role ~= "Innocent" or Toggles.ESPInnocents.Value)
+    for _, char in ipairs(CollectionService:GetTagged("Character")) do
+        if char ~= LP.Character and char.Parent then
+            seen[char] = true
+            local hum = aliveHumanoid(char)
+            local root = char:FindFirstChild("HumanoidRootPart")
 
-            if not show then
-                o.hl.Enabled = false
-                o.name.Visible = false
-                o.tracer.Visible = false
-            else
-                local col = roleColor(role)
-
-                o.hl.Adornee = plr.Character
-                o.hl.FillColor = col
-                o.hl.OutlineColor = col
-                o.hl.Enabled = Toggles.ESPChams.Value
-
-                local head = plr.Character:FindFirstChild("Head") or root
-                local sp, onScreen = cam:WorldToViewportPoint(head.Position + Vector3.new(0, 2, 0))
-                if onScreen and (Toggles.ESPNames.Value or Toggles.ESPDistance.Value) then
-                    local parts = {}
-                    if Toggles.ESPNames.Value then parts[#parts + 1] = ("%s [%s]"):format(plr.DisplayName, role) end
-                    if Toggles.ESPDistance.Value and myRoot then
-                        parts[#parts + 1] = ("%dm"):format(math.floor((root.Position - myRoot.Position).Magnitude + 0.5))
-                    end
-                    o.name.Text = table.concat(parts, "  ")
-                    o.name.Color = col
-                    o.name.Position = Vector2.new(sp.X, sp.Y)
-                    o.name.Visible = true
-                else
-                    o.name.Visible = false
+            -- chams
+            if Toggles.Chams.Value and hum then
+                local hl = Chams[char]
+                if not hl then
+                    hl = Instance.new("Highlight")
+                    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                    hl.Adornee = char
+                    hl.Parent = chamsFolder
+                    Chams[char] = hl
                 end
+                hl.FillColor = Options.ChamsFill.Value
+                hl.OutlineColor = Options.ChamsOutline.Value
+                hl.FillTransparency = Options.ChamsFillTrans.Value / 100
+            elseif Chams[char] then
+                Chams[char]:Destroy()
+                Chams[char] = nil
+            end
 
-                local rp, rootOnScreen = cam:WorldToViewportPoint(root.Position)
-                if Toggles.ESPTracers.Value and rootOnScreen then
-                    o.tracer.From = Vector2.new(vp.X / 2, vp.Y)
-                    o.tracer.To = Vector2.new(rp.X, rp.Y)
-                    o.tracer.Color = col
-                    o.tracer.Visible = true
+            -- drawings
+            local o = ESP[char]
+            local dist = (myRoot and root) and (root.Position - myRoot.Position).Magnitude or 0
+            if not (Toggles.ESPEnabled.Value and hum and root and dist <= Options.ESPMaxDist.Value) then
+                if o then hideESP(o) end
+            else
+                o = o or createESP()
+                ESP[char] = o
+
+                local top = cam:WorldToViewportPoint(root.Position + Vector3.new(0, 2.6, 0))
+                local bot = cam:WorldToViewportPoint(root.Position - Vector3.new(0, 3.1, 0))
+
+                if top.Z <= 0 or bot.Z <= 0 then
+                    hideESP(o)
                 else
-                    o.tracer.Visible = false
+                    local h = math.abs(bot.Y - top.Y)
+                    local w = h * 0.6
+                    local cx = (top.X + bot.X) / 2
+                    local x1, x2, y1, y2 = cx - w / 2, cx + w / 2, top.Y, bot.Y
+
+                    local head = char:FindFirstChild("Head")
+                    local boxColor = Options.BoxColor.Value
+                    if Toggles.ESPVisibleColor.Value and head and isVisible(head, char, cam) then
+                        boxColor = Options.VisibleColor.Value
+                    end
+
+                    -- box
+                    for _, l in ipairs(o.box) do l.Visible = false end
+                    if Toggles.ESPBox.Value then
+                        if Options.BoxStyle.Value == "Full" then
+                            line(o.box[1], Vector2.new(x1, y1), Vector2.new(x2, y1), boxColor)
+                            line(o.box[2], Vector2.new(x1, y2), Vector2.new(x2, y2), boxColor)
+                            line(o.box[3], Vector2.new(x1, y1), Vector2.new(x1, y2), boxColor)
+                            line(o.box[4], Vector2.new(x2, y1), Vector2.new(x2, y2), boxColor)
+                        else
+                            local cw, ch = w * 0.25, h * 0.2
+                            line(o.box[1], Vector2.new(x1, y1), Vector2.new(x1 + cw, y1), boxColor)
+                            line(o.box[2], Vector2.new(x1, y1), Vector2.new(x1, y1 + ch), boxColor)
+                            line(o.box[3], Vector2.new(x2, y1), Vector2.new(x2 - cw, y1), boxColor)
+                            line(o.box[4], Vector2.new(x2, y1), Vector2.new(x2, y1 + ch), boxColor)
+                            line(o.box[5], Vector2.new(x1, y2), Vector2.new(x1 + cw, y2), boxColor)
+                            line(o.box[6], Vector2.new(x1, y2), Vector2.new(x1, y2 - ch), boxColor)
+                            line(o.box[7], Vector2.new(x2, y2), Vector2.new(x2 - cw, y2), boxColor)
+                            line(o.box[8], Vector2.new(x2, y2), Vector2.new(x2, y2 - ch), boxColor)
+                        end
+                    end
+
+                    -- name
+                    if Toggles.ESPName.Value then
+                        local plr = Players:GetPlayerFromCharacter(char)
+                        o.name.Text = plr and plr.DisplayName or char.Name
+                        o.name.Position = Vector2.new(cx, y1 - 16)
+                        o.name.Visible = true
+                    else
+                        o.name.Visible = false
+                    end
+
+                    -- info line under the box
+                    local parts = {}
+                    if Toggles.ESPDistance.Value then parts[#parts + 1] = string.format("%dm", math.floor(dist + 0.5)) end
+                    if Toggles.ESPWeapon.Value then parts[#parts + 1] = heldWeaponName(char) end
+                    if char:FindFirstChildOfClass("ForceField") then parts[#parts + 1] = "[SPAWN]" end
+                    if #parts > 0 then
+                        o.info.Text = table.concat(parts, "  ")
+                        o.info.Position = Vector2.new(cx, y2 + 2)
+                        o.info.Visible = true
+                    else
+                        o.info.Visible = false
+                    end
+
+                    -- health
+                    if Toggles.ESPHealth.Value then
+                        local ratio = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+                        o.hpBack.From = Vector2.new(x1 - 5, y2 + 1)
+                        o.hpBack.To = Vector2.new(x1 - 5, y1 - 1)
+                        o.hpBack.Visible = true
+                        line(o.hpFill, Vector2.new(x1 - 5, y2), Vector2.new(x1 - 5, y2 - h * ratio), Color3.fromHSV(ratio * 0.33, 0.85, 1))
+                    else
+                        o.hpBack.Visible = false
+                        o.hpFill.Visible = false
+                    end
+
+                    -- tracer
+                    if Toggles.ESPTracer.Value then
+                        local from
+                        local origin = Options.TracerOrigin.Value
+                        if origin == "Bottom" then
+                            from = Vector2.new(vp.X / 2, vp.Y)
+                        elseif origin == "Center" then
+                            from = Vector2.new(vp.X / 2, vp.Y / 2)
+                        else
+                            from = UIS:GetMouseLocation()
+                        end
+                        line(o.tracer, from, Vector2.new(cx, y2), Options.TracerColor.Value)
+                    else
+                        o.tracer.Visible = false
+                    end
+
+                    -- skeleton (R6)
+                    for _, l in ipairs(o.skel) do l.Visible = false end
+                    if Toggles.ESPSkeleton.Value then
+                        local torso = char:FindFirstChild("Torso")
+                        if head and torso then
+                            local col = Options.SkeletonColor.Value
+                            local function sp(v3)
+                                local p = cam:WorldToViewportPoint(v3)
+                                return Vector2.new(p.X, p.Y)
+                            end
+                            local neck = sp((torso.CFrame * CFrame.new(0, 1, 0)).Position)
+                            local pelvis = sp((torso.CFrame * CFrame.new(0, -1, 0)).Position)
+                            line(o.skel[1], sp(head.Position), neck, col)
+                            line(o.skel[2], neck, pelvis, col)
+                            local limbs = {
+                                { 3, "Left Arm", neck }, { 4, "Right Arm", neck },
+                                { 5, "Left Leg", pelvis }, { 6, "Right Leg", pelvis },
+                            }
+                            for _, lb in ipairs(limbs) do
+                                local limb = char:FindFirstChild(lb[2])
+                                if limb then
+                                    line(o.skel[lb[1]], lb[3], sp((limb.CFrame * CFrame.new(0, -1, 0)).Position), col)
+                                end
+                            end
+                        end
+                    end
                 end
             end
         end
     end
 
-    -- dropped gun
-    local drop = Toggles.GunESP.Value and findGunDrop()
-    if drop then
-        gunHL.Adornee = drop
-        gunHL.FillColor = Options.ColGun.Value
-        gunHL.OutlineColor = Options.ColGun.Value
-        gunHL.Enabled = true
-        local sp, onScreen = cam:WorldToViewportPoint(drop.Position + Vector3.new(0, 1.5, 0))
-        gunText.Position = Vector2.new(sp.X, sp.Y)
-        gunText.Color = Options.ColGun.Value
-        gunText.Visible = onScreen
-    else
-        gunHL.Enabled = false
-        gunText.Visible = false
+    for char, o in pairs(ESP) do
+        if not seen[char] then
+            removeESP(o)
+            ESP[char] = nil
+        end
+    end
+    for char, hl in pairs(Chams) do
+        if not seen[char] then
+            hl:Destroy()
+            Chams[char] = nil
+        end
     end
 end
 
-bind(Players.PlayerRemoving, removeESP)
+-- ═══════════════════════════════════════════
+-- COMBAT LOOP PIECES
+-- ═══════════════════════════════════════════
+local function updateFOVCircles(cam)
+    local vp = cam.ViewportSize
+    local center = Vector2.new(vp.X / 2, vp.Y / 2)
+
+    silentCircle.Visible = Toggles.ShowSilentFOV.Value
+    silentCircle.Position = center
+    silentCircle.Radius = Options.SilentFOV.Value
+    silentCircle.Color = Options.SilentFOVColor.Value
+
+    aimCircle.Visible = Toggles.ShowAimFOV.Value
+    aimCircle.Position = center
+    aimCircle.Radius = Options.AimFOV.Value
+    aimCircle.Color = Options.AimFOVColor.Value
+end
+
+local function updateAimbot(cam)
+    if not (Toggles.Aimbot.Value and Options.AimKey:GetState()) then return end
+    local _, part = getTarget(Options.AimFOV.Value, Options.AimPart.Value, Toggles.AimWallCheck.Value)
+    if not part then return end
+
+    local aimPos = part.Position
+    if Toggles.AimPrediction.Value then
+        local speed = Hook.WeaponManager and Hook.WeaponManager.Constants.DEFAULT_SPEED or 3850
+        local travel = (aimPos - cam.CFrame.Position).Magnitude / speed
+        aimPos += part.AssemblyLinearVelocity * travel
+    end
+    cam.CFrame = cam.CFrame:Lerp(CFrame.lookAt(cam.CFrame.Position, aimPos), 1 / Options.AimSmooth.Value)
+end
+
+local triggerPending = false
+local function updateTriggerbot(cam)
+    if not Toggles.Triggerbot.Value or triggerPending then return end
+    setRayIgnore(cam)
+    local hit = workspace:Raycast(cam.CFrame.Position, cam.CFrame.LookVector * 1500, rayParams)
+    if not hit then return end
+    local model = hit.Instance:FindFirstAncestorWhichIsA("Model")
+    if model and model ~= LP.Character and CollectionService:HasTag(model, "Character")
+        and aliveHumanoid(model) and not model:FindFirstChildOfClass("ForceField") then
+        triggerPending = true
+        task.delay(Options.TriggerDelay.Value / 1000, function()
+            if Running then WeaponClient.fire() end
+            triggerPending = false
+        end)
+    end
+end
+
+local function updateAutoShoot()
+    if not (Toggles.AutoShoot.Value and Toggles.SilentAim.Value) then return end
+    if WeaponClient.getState() ~= "free" then return end
+    -- always wall-checked: shooting through walls is exactly what gets a packet rejected
+    local _, part = getTarget(Options.SilentFOV.Value, Options.SilentPart.Value, true)
+    if part then WeaponClient.fire() end
+end
 
 -- ═══════════════════════════════════════════
--- PLAYER
+-- WORLD
 -- ═══════════════════════════════════════════
-local speedApplied, jumpApplied = false, false
+local lightingSaved
+local function updateFullbright()
+    if Toggles.Fullbright.Value then
+        if not lightingSaved then
+            lightingSaved = {
+                Brightness = Lighting.Brightness, ClockTime = Lighting.ClockTime,
+                FogEnd = Lighting.FogEnd, GlobalShadows = Lighting.GlobalShadows, Ambient = Lighting.Ambient,
+            }
+        end
+        Lighting.Brightness = 2
+        Lighting.ClockTime = 14
+        Lighting.FogEnd = 1e5
+        Lighting.GlobalShadows = false
+        Lighting.Ambient = Color3.fromRGB(180, 180, 180)
+    elseif lightingSaved then
+        for k, v in pairs(lightingSaved) do Lighting[k] = v end
+        lightingSaved = nil
+    end
+end
 
-local function updatePlayer()
+local fovApplied = false
+local function updateFOV(cam)
+    if Toggles.FOVChanger.Value then
+        if not WeaponClient.isScoping() then
+            cam.FieldOfView = Options.FOVValue.Value
+            fovApplied = true
+        end
+    elseif fovApplied then
+        cam.FieldOfView = GAME_DEFAULT_FOV
+        fovApplied = false
+    end
+end
+
+-- ═══════════════════════════════════════════
+-- MOVEMENT (NewChecker-safe)
+-- ═══════════════════════════════════════════
+local flyPos = nil
+
+local function markAirborne(char)
+    -- NewChecker skips the airtime check while lastJumpBoost is < 3s old
+    char:SetAttribute("lastJumpBoost", workspace:GetServerTimeNow())
+end
+
+local function updateMovement(dt)
     local char = LP.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if not hum then return end
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not (hum and root and hum.Health > 0) then
+        flyPos = nil
+        return
+    end
+    local cam = workspace.CurrentCamera
 
-    if Toggles.Speed.Value then
-        hum.WalkSpeed = Options.SpeedValue.Value
-        speedApplied = true
-    elseif speedApplied then
-        hum.WalkSpeed = DEFAULT_WALKSPEED
-        speedApplied = false
+    -- fly: CFrame-tracked, zero velocity, yaw-only rotation
+    if Toggles.Fly.Value then
+        flyPos = flyPos or root.Position
+        local dir = Vector3.zero
+        if not UIS:GetFocusedTextBox() then
+            local cf = cam.CFrame
+            if UIS:IsKeyDown(Enum.KeyCode.W) then dir += cf.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.S) then dir -= cf.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.A) then dir -= cf.RightVector end
+            if UIS:IsKeyDown(Enum.KeyCode.D) then dir += cf.RightVector end
+            if UIS:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+            if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then dir -= Vector3.yAxis end
+        end
+        if dir.Magnitude > 0 then dir = dir.Unit end
+        flyPos += dir * Options.FlySpeed.Value * dt
+
+        local look = cam.CFrame.LookVector
+        local yaw = math.atan2(-look.X, -look.Z)
+        root.CFrame = CFrame.new(flyPos) * CFrame.Angles(0, yaw, 0)
+        root.AssemblyLinearVelocity = Vector3.zero
+        markAirborne(char)
+        return
+    end
+    flyPos = nil
+
+    -- speed: CFrame nudge, horizontal velocity stays under NewChecker's 50 cap
+    if Toggles.Speed.Value and hum.MoveDirection.Magnitude > 0 then
+        local extra = math.max(Options.SpeedValue.Value - hum.WalkSpeed, 0)
+        root.CFrame += hum.MoveDirection * extra * dt
     end
 
-    if Toggles.Jump.Value then
-        hum.UseJumpPower = true
-        hum.JumpPower = Options.JumpValue.Value
-        jumpApplied = true
-    elseif jumpApplied then
-        hum.JumpPower = DEFAULT_JUMPPOWER
-        jumpApplied = false
+    -- bhop
+    if Toggles.Bhop.Value and not UIS:GetFocusedTextBox() and UIS:IsKeyDown(Enum.KeyCode.Space)
+        and hum.FloorMaterial ~= Enum.Material.Air then
+        hum.Jump = true
+    end
+
+    if hum.FloorMaterial == Enum.Material.Air and (Toggles.InfJump.Value or Toggles.Speed.Value) then
+        markAirborne(char)
     end
 end
 
 bind(UIS.JumpRequest, function()
     if not (Running and Toggles.InfJump.Value) then return end
-    local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-    if hum and hum.Health > 0 then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    local char = LP.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not (hum and root and hum.Health > 0) then return end
+    if hum.FloorMaterial == Enum.Material.Air then
+        -- straight velocity write, no Jumping state -> NewChecker's Jumping handler never fires
+        local v = root.AssemblyLinearVelocity
+        root.AssemblyLinearVelocity = Vector3.new(v.X, JUMP_VELOCITY, v.Z)
+        markAirborne(char)
+    end
 end)
 
 bind(RunService.Stepped, function()
-    if not Running then return end
-    if not (Toggles.Noclip.Value or Toggles.CoinFarm.Value) then return end
+    if not (Running and Toggles.Noclip.Value) then return end
     local char = LP.Character
     if not char then return end
     for _, p in ipairs(char:GetDescendants()) do
         if p:IsA("BasePart") then p.CanCollide = false end
+    end
+end)
+
+-- ═══════════════════════════════════════════
+-- AUTOMATION
+-- ═══════════════════════════════════════════
+-- auto respawn: watcher, not a one-shot Died handler.
+--   * remembers the character was deployed while alive (the attribute can clear on death)
+--   * works even if the toggle is flipped on after you already died
+--   * retries every 1.5s until the server gives you a new character
+-- respawn(true) on a dead deployed character is exactly what the game's own Leave screen sends.
+-- lobby deaths (never deployed) are already auto-respawned by the game after 3s.
+task.spawn(function()
+    local deployedChar = nil
+    local lastAttempt = 0
+    while Running do
+        local char = LP.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            if hum.Health > 0 then
+                if char:GetAttribute("deployed") then deployedChar = char end
+            elseif Toggles.AutoRespawn.Value and (deployedChar == char or char:GetAttribute("deployed")) then
+                if os.clock() - lastAttempt >= 1.5 then
+                    lastAttempt = os.clock()
+                    DeathScreen._requestRespawn(true)
+                end
+            end
+        end
+        task.wait(0.25)
+    end
+end)
+
+task.spawn(function()
+    while Running do
+        if Toggles.AutoDeploy.Value and workspace:GetAttribute("gameState") == "game" then
+            local char = LP.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 and not char:GetAttribute("deployed") then
+                DeployClient.deploy()
+            end
+        end
+        task.wait(1)
     end
 end)
 
@@ -811,23 +953,21 @@ end)
 -- ═══════════════════════════════════════════
 bind(RunService.RenderStepped, function()
     if not Running then return end
-    updateESP()
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    updateFOVCircles(cam)
+    updateAimbot(cam)
+    updateTriggerbot(cam)
+    updateAutoShoot()
+    updateESP(cam)
+    updateFullbright()
+    updateFOV(cam)
 end)
 
 bind(RunService.Heartbeat, function(dt)
     if not Running then return end
-    updatePlayer()
-    updateKillAura()
-    updateCoinFarm(dt)
+    updateMovement(dt)
 end)
-
--- status: what this executor can actually do
-do
-    local lines = {}
-    if not firetouchinterest then lines[#lines + 1] = "knife aura: unavailable (no firetouchinterest)" end
-    lines[#lines + 1] = "silent aim: WeaponService patched (confirm with one test shot)"
-    hookStatus:SetText(table.concat(lines, "\n"))
-end
 
 -- ═══════════════════════════════════════════
 -- UNLOAD
@@ -836,23 +976,27 @@ Library:OnUnload(function()
     Running = false
     for _, c in ipairs(Conns) do c:Disconnect() end
 
-    WeaponService.GetMouseTargetCFrame = origGetMouseTargetCFrame
-    WeaponService.GetTargetPosition = origGetTargetPosition
-
-    for plr in pairs(ESP) do removeESP(plr) end
-    gunText:Remove()
-    espFolder:Destroy()
-
-    local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-    if hum then
-        if speedApplied then hum.WalkSpeed = DEFAULT_WALKSPEED end
-        if jumpApplied then hum.JumpPower = DEFAULT_JUMPPOWER end
+    if Hook.useWeapon and Hook.origSend then
+        Hook.useWeapon.send = Hook.origSend
     end
+    restoreAllFields()
 
-    G.__mana_mm2_unload = nil
+    for _, o in pairs(ESP) do removeESP(o) end
+    table.clear(ESP)
+    silentCircle:Remove()
+    aimCircle:Remove()
+    chamsFolder:Destroy()
+
+    if lightingSaved then
+        for k, v in pairs(lightingSaved) do Lighting[k] = v end
+    end
+    if fovApplied and workspace.CurrentCamera then
+        workspace.CurrentCamera.FieldOfView = GAME_DEFAULT_FOV
+    end
+    G.__rs_onetap_unload = nil
 end)
 
-G.__mana_mm2_unload = function() Library:Unload() end
+G.__rs_onetap_unload = function() Library:Unload() end
 
 -- ═══════════════════════════════════════════
 -- CONFIG / THEMES
@@ -861,10 +1005,10 @@ ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
 SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
-ThemeManager:SetFolder("ManaMM2")
-SaveManager:SetFolder("ManaMM2/MM2")
+ThemeManager:SetFolder("ManaFPS")
+SaveManager:SetFolder("ManaFPS/OneTap")
 SaveManager:BuildConfigSection(Tabs["UI Settings"])
 ThemeManager:ApplyToTab(Tabs["UI Settings"])
 SaveManager:LoadAutoloadConfig()
 
-Library:Notify({ Title = "MANA MM2", Description = "loaded. RightShift toggles the menu.", Time = 4 })
+Library:Notify({ Title = "MANA FPS", Description = "loaded. RightShift toggles the menu.", Time = 4 })
