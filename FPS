@@ -1,0 +1,870 @@
+--[[
+    MANA MM2 — Murder Mystery 2
+    UI: Obsidian (deividcomsono)
+    Key: R/SCRIPTS2026
+
+    dump notes (what this is built on):
+      - no anticheat listed.
+      - roles: Remotes.Gameplay.GetCurrentPlayerData (InvokeServer) + PlayerDataChanged / RoundStart (OnClientEvent)
+        give a table keyed by player name: { Role = "Murderer"|"Sheriff"|"Hero"|"Innocent", Dead, Knife, Gun, Perk }
+        the client already receives every role (CurrentRoundClient.GetMurdererPerk scans it).
+      - weapons: Tool tagged "Weapon_Knife" / "Weapon_Gun" (CollectionService, replicated).
+      - coins: <Map>.CoinContainer.Coin_Server parts, attrs CoinID + Collected.
+        CoinCollected(coinId, current, max) -> bag full when max <= current; CoinsStarted resets.
+      - aiming: ClientServices.WeaponService.GetMouseTargetCFrame / GetTargetPosition turn the mouse into the
+        world point weapons aim at. zero callers in the 268 dumped scripts -> their callers are the Gun/Knife
+        tool scripts the dumper skipped. silent aim replaces those two module fields.
+      - emotes: Remotes.Misc.PlayEmote is a BindableEvent. Animate's handler plays any Sync.Emotes key with no
+        ownership check (only the /e chat path checks ProfileData.Emotes.Owned), and Animate loads every emote.
+        your own character's animations replicate, so others see them.
+      - NOT in this dump (verify live): the dropped gun's name ("GunDrop", the long-standing MM2 name) and
+        whether the knife registers firetouchinterest touches (kill aura).
+]]
+
+-- ═══════════════════════════════════════════
+-- PRECONDITIONS
+-- ═══════════════════════════════════════════
+local function need(ok, what)
+    if not ok then error("[MANA MM2] executor is missing: " .. what, 0) end
+end
+need(Drawing and Drawing.new, "Drawing library")
+need(loadstring, "loadstring")
+need(setclipboard, "setclipboard")
+
+local G = getgenv()
+if G.__mana_mm2_unload then pcall(G.__mana_mm2_unload) end
+
+-- ═══════════════════════════════════════════
+-- SERVICES
+-- ═══════════════════════════════════════════
+local cloneref = cloneref or function(o) return o end
+local function svc(n) return cloneref(game:GetService(n)) end
+
+local Players = svc("Players")
+local RS = svc("ReplicatedStorage")
+local RunService = svc("RunService")
+local UIS = svc("UserInputService")
+local CollectionService = svc("CollectionService")
+local HttpService = svc("HttpService")
+local TeleportService = svc("TeleportService")
+local VirtualUser = svc("VirtualUser")
+
+local LP = Players.LocalPlayer
+
+-- ═══════════════════════════════════════════
+-- CONSTANTS
+-- ═══════════════════════════════════════════
+local KEY = "R/SCRIPTS2026"
+local LINK_LINKVERTISE = "https://direct-link.net/3535552/Beq3v5uY3e6O"
+local LINK_WORKINK = "https://work.ink/2l6R/mana-script-key-system"
+
+local REPO = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+local LIB_SOURCE = game:HttpGet(REPO .. "Library.lua")
+local function newLibrary() return loadstring(LIB_SOURCE)() end
+
+local DEFAULT_WALKSPEED = 16
+local DEFAULT_JUMPPOWER = 50
+local GUN_DROP_NAME = "GunDrop"
+
+-- ═══════════════════════════════════════════
+-- KEY SCREEN
+-- ═══════════════════════════════════════════
+do
+    local KL = newLibrary()
+    local KW = KL:CreateWindow({
+        Title = "MANA MM2",
+        Footer = "Murder Mystery 2  |  key system",
+        NotifySide = "Right",
+        ShowCustomCursor = true,
+    })
+
+    local KT = KW:AddTab("Key", "key")
+    local authed = false
+
+    local enter = KT:AddLeftGroupbox("Enter Key", "key")
+    enter:AddLabel("paste your key below. grab one from either link on the right.", true)
+    enter:AddInput("KeyInput", {
+        Text = "Key",
+        Default = "",
+        Placeholder = "R/...",
+        Numeric = false,
+        Finished = false,
+        ClearTextOnFocus = false,
+    })
+    enter:AddButton({
+        Text = "Check Key",
+        Func = function()
+            if KL.Options.KeyInput.Value == KEY then
+                KL:Notify({ Title = "MANA MM2", Description = "key accepted. loading...", Time = 2 })
+                authed = true
+            else
+                KL:Notify({ Title = "MANA MM2", Description = "invalid key", Time = 3 })
+            end
+        end,
+    })
+
+    local get = KT:AddRightGroupbox("Get Key", "link")
+    get:AddButton({
+        Text = "Copy Linkvertise Link",
+        Func = function()
+            setclipboard(LINK_LINKVERTISE)
+            KL:Notify({ Title = "Linkvertise", Description = "link copied to clipboard", Time = 3 })
+        end,
+    })
+    get:AddButton({
+        Text = "Copy Work.ink Link",
+        Func = function()
+            setclipboard(LINK_WORKINK)
+            KL:Notify({ Title = "Work.ink", Description = "link copied to clipboard", Time = 3 })
+        end,
+    })
+    get:AddDivider()
+    get:AddLabel("open the copied link in your browser, finish the steps, paste the key on the left.", true)
+
+    repeat task.wait(0.1) until authed
+    task.wait(0.4)
+    KL:Unload()
+end
+
+-- ═══════════════════════════════════════════
+-- GAME REFERENCES
+-- ═══════════════════════════════════════════
+local Gameplay = RS:WaitForChild("Remotes"):WaitForChild("Gameplay")
+local WeaponService = require(RS:WaitForChild("ClientServices"):WaitForChild("WeaponService"))
+local Sync = require(RS:WaitForChild("Database"):WaitForChild("Sync"))
+local PlayEmoteEvent = RS.Remotes:WaitForChild("Misc"):WaitForChild("PlayEmote")
+
+-- ═══════════════════════════════════════════
+-- CATALOGS (built from the game's own database)
+-- ═══════════════════════════════════════════
+local Emotes = { labels = {}, byLabel = {}, animIds = {} }
+for key, e in pairs(Sync.Emotes) do
+    if e.AnimationID then
+        local label = e.Name or key
+        if Emotes.byLabel[label] then label = ("%s (%s)"):format(label, key) end
+        Emotes.byLabel[label] = key
+        Emotes.labels[#Emotes.labels + 1] = label
+        Emotes.animIds[tonumber(e.AnimationID)] = true
+    end
+end
+table.sort(Emotes.labels)
+
+-- ═══════════════════════════════════════════
+-- STATE
+-- ═══════════════════════════════════════════
+local Running = true
+local Conns = {}
+local function bind(signal, fn)
+    local c = signal:Connect(fn)
+    Conns[#Conns + 1] = c
+    return c
+end
+
+local PlayerData = {}       -- [playerName] = { Role, Dead, Knife, Gun, Perk }
+local BagFull = {}          -- [coinId] = true once that bag is full
+local forceSilent = false   -- set by the Shoot Murderer button for one shot
+
+-- ═══════════════════════════════════════════
+-- UI
+-- ═══════════════════════════════════════════
+local Library = newLibrary()
+local ThemeManager = loadstring(game:HttpGet(REPO .. "addons/ThemeManager.lua"))()
+local SaveManager = loadstring(game:HttpGet(REPO .. "addons/SaveManager.lua"))()
+local Options, Toggles = Library.Options, Library.Toggles
+
+local Window = Library:CreateWindow({
+    Title = "MANA MM2",
+    Footer = "Murder Mystery 2  |  v1.0",
+    NotifySide = "Right",
+    ShowCustomCursor = true,
+})
+
+local Tabs = {
+    Main = Window:AddTab("Main", "crosshair"),
+    Visuals = Window:AddTab("Visuals", "eye"),
+    Farm = Window:AddTab("Farm", "coins"),
+    Emotes = Window:AddTab("Emotes", "smile"),
+    Player = Window:AddTab("Player", "user"),
+    Misc = Window:AddTab("Misc", "box"),
+    ["UI Settings"] = Window:AddTab("UI Settings", "settings"),
+}
+
+local shootMurderer, grabGun, playSelectedEmote, stopEmotes -- defined below, used by buttons
+
+-- ── MAIN ───────────────────────────────────
+local hookStatus, roleLabel
+do
+    local aim = Tabs.Main:AddLeftGroupbox("Silent Aim", "target")
+    aim:AddToggle("SilentAim", { Text = "Silent Aim", Default = false,
+        Tooltip = "sheriff/hero: shots go to the murderer. murderer: throws go to the closest player to your mouse." })
+    aim:AddSlider("Prediction", { Text = "Prediction (ms)", Default = 120, Min = 0, Max = 400, Rounding = 0 })
+    aim:AddDivider()
+    aim:AddButton({ Text = "Shoot Murderer", Func = function() shootMurderer() end })
+    aim:AddLabel("Shoot keybind"):AddKeyPicker("ShootKey", { Default = "Q", Mode = "Toggle", Text = "Shoot Murderer", NoUI = false,
+        Callback = function() shootMurderer() end })
+
+    local knife = Tabs.Main:AddLeftGroupbox("Murderer", "sword")
+    knife:AddToggle("KillAura", { Text = "Knife Aura", Default = false, Risky = true,
+        Tooltip = "stabs anyone in range while you hold the knife (needs firetouchinterest)" })
+    knife:AddSlider("AuraRange", { Text = "Range", Default = 12, Min = 4, Max = 25, Rounding = 0 })
+
+    local gun = Tabs.Main:AddRightGroupbox("Gun", "hand")
+    gun:AddToggle("AutoGrabGun", { Text = "Auto Grab Dropped Gun", Default = false,
+        Tooltip = "teleports to the dropped gun and back. never as murderer." })
+    gun:AddButton({ Text = "Grab Gun Now", Func = function() grabGun() end })
+
+    local info = Tabs.Main:AddRightGroupbox("Round", "info")
+    roleLabel = info:AddLabel("murderer: ?\nsheriff: ?", true)
+    info:AddToggle("RoleNotify", { Text = "Notify Roles", Default = true, Tooltip = "popup with murderer + sheriff each round" })
+    hookStatus = info:AddLabel("", true)
+end
+
+-- ── VISUALS ────────────────────────────────
+do
+    local esp = Tabs.Visuals:AddLeftGroupbox("Role ESP", "scan-eye")
+    esp:AddToggle("ESPEnabled", { Text = "Enabled", Default = false })
+    esp:AddToggle("ESPChams", { Text = "Chams", Default = true })
+    esp:AddToggle("ESPNames", { Text = "Name + Role", Default = true })
+    esp:AddToggle("ESPDistance", { Text = "Distance", Default = true })
+    esp:AddToggle("ESPTracers", { Text = "Tracers", Default = false })
+    esp:AddToggle("ESPInnocents", { Text = "Show Innocents", Default = true })
+
+    local colors = Tabs.Visuals:AddRightGroupbox("Colors", "palette")
+    colors:AddLabel("Murderer"):AddColorPicker("ColMurderer", { Default = Color3.fromRGB(255, 50, 50), Title = "Murderer" })
+    colors:AddLabel("Sheriff"):AddColorPicker("ColSheriff", { Default = Color3.fromRGB(60, 140, 255), Title = "Sheriff" })
+    colors:AddLabel("Hero"):AddColorPicker("ColHero", { Default = Color3.fromRGB(255, 210, 60), Title = "Hero" })
+    colors:AddLabel("Innocent"):AddColorPicker("ColInnocent", { Default = Color3.fromRGB(80, 230, 120), Title = "Innocent" })
+    colors:AddLabel("Dropped Gun"):AddColorPicker("ColGun", { Default = Color3.fromRGB(255, 255, 255), Title = "Dropped Gun" })
+
+    local gunEsp = Tabs.Visuals:AddRightGroupbox("Dropped Gun", "crosshair")
+    gunEsp:AddToggle("GunESP", { Text = "Dropped Gun ESP", Default = true })
+end
+
+-- ── FARM ───────────────────────────────────
+do
+    local farm = Tabs.Farm:AddLeftGroupbox("Coin Farm", "coins")
+    farm:AddToggle("CoinFarm", { Text = "Auto Farm Coins", Default = false,
+        Tooltip = "flies coin to coin until your bag is full" })
+    farm:AddSlider("FarmSpeed", { Text = "Speed (studs/s)", Default = 25, Min = 10, Max = 60, Rounding = 0 })
+    farm:AddToggle("AvoidMurderer", { Text = "Avoid Murderer", Default = true })
+    farm:AddSlider("AvoidRadius", { Text = "Avoid Radius", Default = 25, Min = 10, Max = 80, Rounding = 0 })
+    farm:AddLabel("high speeds are the easiest thing for the server to flag. 25 is a safe pace.", true)
+end
+
+-- ── EMOTES ─────────────────────────────────
+do
+    local em = Tabs.Emotes:AddLeftGroupbox("All Emotes", "smile")
+    em:AddLabel(("%d emotes, all unlocked. other players see them."):format(#Emotes.labels), true)
+    em:AddDropdown("EmotePick", { Text = "Emote", Values = Emotes.labels, Default = 1, Searchable = true })
+    em:AddButton({ Text = "Play", Func = function() playSelectedEmote() end })
+    em:AddButton({ Text = "Stop", Func = function() stopEmotes() end })
+    em:AddLabel("Play keybind"):AddKeyPicker("EmoteKey", { Default = "G", Mode = "Toggle", Text = "Play Emote", NoUI = false,
+        Callback = function() playSelectedEmote() end })
+
+    local quick = Tabs.Emotes:AddRightGroupbox("Quick Play", "zap")
+    quick:AddLabel("stand still: the game only starts emotes while you're standing.", true)
+    quick:AddButton({ Text = "Random Emote", Func = function()
+        Options.EmotePick:SetValue(Emotes.labels[math.random(#Emotes.labels)])
+        playSelectedEmote()
+    end })
+end
+
+-- ── PLAYER ─────────────────────────────────
+do
+    local mv = Tabs.Player:AddLeftGroupbox("Movement", "footprints")
+    mv:AddToggle("Speed", { Text = "Walk Speed", Default = false })
+    mv:AddSlider("SpeedValue", { Text = "Speed", Default = 24, Min = 16, Max = 60, Rounding = 0 })
+    mv:AddToggle("Jump", { Text = "Jump Power", Default = false })
+    mv:AddSlider("JumpValue", { Text = "Power", Default = 65, Min = 50, Max = 150, Rounding = 0 })
+    mv:AddToggle("InfJump", { Text = "Infinite Jump", Default = false })
+    mv:AddToggle("Noclip", { Text = "Noclip", Default = false })
+end
+
+-- ── MISC ───────────────────────────────────
+do
+    local util = Tabs.Misc:AddLeftGroupbox("Utility", "wrench")
+    util:AddToggle("AntiAFK", { Text = "Anti AFK", Default = true })
+
+    local server = Tabs.Misc:AddRightGroupbox("Server", "server")
+    server:AddButton({ Text = "Rejoin", Func = function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LP)
+    end })
+    server:AddButton({ Text = "Server Hop", Func = function()
+        local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100"):format(game.PlaceId)
+        local data = HttpService:JSONDecode(game:HttpGet(url))
+        for _, s in ipairs(data.data) do
+            if s.id ~= game.JobId and s.playing < s.maxPlayers then
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, s.id, LP)
+                return
+            end
+        end
+        Library:Notify({ Title = "Server Hop", Description = "no open servers found", Time = 3 })
+    end })
+    server:AddButton({ Text = "Copy Job ID", Func = function()
+        setclipboard(game.JobId)
+        Library:Notify({ Title = "MANA MM2", Description = "job id copied", Time = 2 })
+    end })
+end
+
+-- ── UI SETTINGS ────────────────────────────
+do
+    local menu = Tabs["UI Settings"]:AddLeftGroupbox("Menu", "wrench")
+    menu:AddToggle("KeybindMenuOpen", { Text = "Keybind List", Default = Library.KeybindFrame.Visible,
+        Callback = function(v) Library.KeybindFrame.Visible = v end })
+    menu:AddToggle("ShowCustomCursor", { Text = "Custom Cursor", Default = true,
+        Callback = function(v) Library.ShowCustomCursor = v end })
+    menu:AddDropdown("DPIDropdown", { Text = "DPI Scale", Values = { "75%", "100%", "125%", "150%" }, Default = "100%",
+        Callback = function(v) Library:SetDPIScale(tonumber((v:gsub("%%", "")))) end })
+    menu:AddDivider()
+    menu:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", { Default = "RightShift", NoUI = true, Text = "Menu keybind" })
+    menu:AddButton({ Text = "Unload", Func = function() Library:Unload() end })
+    Library.ToggleKeybind = Options.MenuKeybind
+end
+
+-- ═══════════════════════════════════════════
+-- ROLES
+-- ═══════════════════════════════════════════
+local function findTool(holder, tag)
+    if not holder then return nil end
+    for _, t in ipairs(holder:GetChildren()) do
+        if t:IsA("Tool") and CollectionService:HasTag(t, tag) then return t end
+    end
+    return nil
+end
+
+-- own tools: character + backpack. other players: only the equipped tool replicates.
+local function ownTool(tag)
+    return findTool(LP.Character, tag) or findTool(LP:FindFirstChildOfClass("Backpack"), tag)
+end
+
+local function getRole(plr)
+    local d = PlayerData[plr.Name]
+    local role = d and not d.Dead and d.Role or nil
+    -- picked-up gun shows on the character before the data table catches up
+    if role == "Innocent" and findTool(plr.Character, "Weapon_Gun") then role = "Hero" end
+    if plr == LP then
+        if ownTool("Weapon_Knife") then role = "Murderer" end
+        if role ~= "Murderer" and ownTool("Weapon_Gun") and role ~= "Sheriff" then role = "Hero" end
+    end
+    return role
+end
+
+local function findByRole(role)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if getRole(plr) == role then return plr end
+    end
+    return nil
+end
+
+local function rootOf(plr)
+    local char = plr and plr.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (hum and hum.Health > 0) then return nil end
+    return char:FindFirstChild("HumanoidRootPart")
+end
+
+local lastAnnounced = nil
+local function onDataUpdated()
+    local murderer = findByRole("Murderer")
+    local sheriff = findByRole("Sheriff") or findByRole("Hero")
+    roleLabel:SetText(("murderer: %s\nsheriff: %s"):format(
+        murderer and murderer.DisplayName or "?", sheriff and sheriff.DisplayName or "?"))
+
+    if Toggles.RoleNotify.Value and murderer and murderer.Name ~= lastAnnounced then
+        lastAnnounced = murderer.Name
+        Library:Notify({
+            Title = "Roles",
+            Description = ("Murderer: %s\nSheriff: %s"):format(murderer.DisplayName, sheriff and sheriff.DisplayName or "?"),
+            Time = 6,
+        })
+    end
+end
+
+local function setPlayerData(d)
+    if type(d) == "table" then PlayerData = d end
+    onDataUpdated()
+end
+
+bind(Gameplay:WaitForChild("PlayerDataChanged").OnClientEvent, setPlayerData)
+bind(Gameplay:WaitForChild("RoundStart").OnClientEvent, function(_, data)
+    lastAnnounced = nil
+    setPlayerData(data)
+end)
+task.spawn(function()
+    setPlayerData(Gameplay:WaitForChild("GetCurrentPlayerData"):InvokeServer())
+end)
+
+-- ═══════════════════════════════════════════
+-- SILENT AIM (WeaponService field swap)
+-- ═══════════════════════════════════════════
+local origGetMouseTargetCFrame = WeaponService.GetMouseTargetCFrame
+local origGetTargetPosition = WeaponService.GetTargetPosition
+
+local function predicted(root)
+    return root.Position + root.AssemblyLinearVelocity * (Options.Prediction.Value / 1000)
+end
+
+local function closestToMouse()
+    local cam = workspace.CurrentCamera
+    local mouse = UIS:GetMouseLocation()
+    local best, bestD
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP then
+            local root = rootOf(plr)
+            if root then
+                local sp, onScreen = cam:WorldToViewportPoint(root.Position)
+                if onScreen then
+                    local d = (Vector2.new(sp.X, sp.Y) - mouse).Magnitude
+                    if not bestD or d < bestD then best, bestD = root, d end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function silentAimPoint()
+    if not (Toggles.SilentAim.Value or forceSilent) then return nil end
+    if getRole(LP) == "Murderer" then
+        local root = closestToMouse()
+        return root and predicted(root)
+    end
+    local root = rootOf(findByRole("Murderer"))
+    return root and predicted(root)
+end
+
+WeaponService.GetMouseTargetCFrame = function(self, ...)
+    if Running then
+        local p = silentAimPoint()
+        if p then return CFrame.new(p) end
+    end
+    return origGetMouseTargetCFrame(self, ...)
+end
+
+WeaponService.GetTargetPosition = function(self, ...)
+    if Running then
+        local p = silentAimPoint()
+        if p then return CFrame.new(p) end
+    end
+    return origGetTargetPosition(self, ...)
+end
+
+function shootMurderer()
+    local gun = ownTool("Weapon_Gun")
+    if not gun then
+        Library:Notify({ Title = "MANA MM2", Description = "you don't have the gun", Time = 2 })
+        return
+    end
+    if not rootOf(findByRole("Murderer")) then
+        Library:Notify({ Title = "MANA MM2", Description = "murderer not found yet", Time = 2 })
+        return
+    end
+    local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    if gun.Parent ~= LP.Character then
+        hum:EquipTool(gun)
+        task.wait(0.15)
+    end
+    forceSilent = true
+    gun:Activate()
+    task.delay(0.4, function() forceSilent = false end)
+end
+
+-- ═══════════════════════════════════════════
+-- KNIFE AURA
+-- ═══════════════════════════════════════════
+local lastStab = 0
+local function updateKillAura()
+    if not Toggles.KillAura.Value then return end
+    if not firetouchinterest then return end
+    local knife = findTool(LP.Character, "Weapon_Knife")
+    local handle = knife and knife:FindFirstChild("Handle")
+    local myRoot = rootOf(LP)
+    if not (handle and myRoot) then return end
+    if os.clock() - lastStab < 0.25 then return end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP then
+            local root = rootOf(plr)
+            if root and (root.Position - myRoot.Position).Magnitude <= Options.AuraRange.Value then
+                lastStab = os.clock()
+                knife:Activate()
+                firetouchinterest(handle, root, 0)
+                firetouchinterest(handle, root, 1)
+                return
+            end
+        end
+    end
+end
+
+-- ═══════════════════════════════════════════
+-- DROPPED GUN
+-- ═══════════════════════════════════════════
+local function findGunDrop()
+    local d = workspace:FindFirstChild(GUN_DROP_NAME, true)
+    return d and d:IsA("BasePart") and d or nil
+end
+
+local grabbing = false
+function grabGun()
+    if grabbing then return end
+    local drop = findGunDrop()
+    local myRoot = rootOf(LP)
+    if not (drop and myRoot) then
+        Library:Notify({ Title = "MANA MM2", Description = "no dropped gun right now", Time = 2 })
+        return
+    end
+    if getRole(LP) == "Murderer" then return end
+    grabbing = true
+    local back = myRoot.CFrame
+    myRoot.CFrame = drop.CFrame
+    task.wait(0.3)
+    if rootOf(LP) == myRoot then myRoot.CFrame = back end
+    grabbing = false
+end
+
+task.spawn(function()
+    while Running do
+        if Toggles.AutoGrabGun.Value and not grabbing and findGunDrop()
+            and getRole(LP) ~= "Murderer" and not ownTool("Weapon_Gun") and rootOf(LP) then
+            grabGun()
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- ═══════════════════════════════════════════
+-- EMOTES
+-- ═══════════════════════════════════════════
+function playSelectedEmote()
+    local key = Emotes.byLabel[Options.EmotePick.Value]
+    if key then PlayEmoteEvent:Fire(key) end
+end
+
+function stopEmotes()
+    local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    if not animator then return end
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        local id = tonumber(tostring(track.Animation and track.Animation.AnimationId or ""):match("(%d+)$"))
+        if id and Emotes.animIds[id] then track:Stop(0.2) end
+    end
+end
+
+-- ═══════════════════════════════════════════
+-- COIN FARM
+-- ═══════════════════════════════════════════
+bind(Gameplay:WaitForChild("CoinCollected").OnClientEvent, function(coinId, current, max)
+    if type(current) == "number" and type(max) == "number" and max <= current then
+        BagFull[coinId] = true
+    end
+end)
+bind(Gameplay:WaitForChild("CoinsStarted").OnClientEvent, function() table.clear(BagFull) end)
+
+local skipped = {}   -- coins we reached that never registered
+local farmTarget, farmArrived = nil, nil
+
+local function nextCoin(myRoot)
+    local murderer = Toggles.AvoidMurderer.Value and rootOf(findByRole("Murderer"))
+    local best, bestD
+    for _, map in ipairs(workspace:GetChildren()) do
+        local container = map:FindFirstChild("CoinContainer")
+        if container then
+            for _, coin in ipairs(container:GetChildren()) do
+                if coin.Name == "Coin_Server" and coin:IsA("BasePart") and not coin:GetAttribute("Collected")
+                    and not skipped[coin] and not BagFull[coin:GetAttribute("CoinID")]
+                    and not (murderer and (coin.Position - murderer.Position).Magnitude < Options.AvoidRadius.Value) then
+                    local d = (coin.Position - myRoot.Position).Magnitude
+                    if not bestD or d < bestD then best, bestD = coin, d end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function updateCoinFarm(dt)
+    if not Toggles.CoinFarm.Value then
+        farmTarget = nil
+        return
+    end
+    local myData = PlayerData[LP.Name]
+    local myRoot = rootOf(LP)
+    if not (myRoot and myData and not myData.Dead) then
+        farmTarget = nil
+        return
+    end
+
+    if not farmTarget or not farmTarget.Parent or farmTarget:GetAttribute("Collected") then
+        farmTarget = nextCoin(myRoot)
+        farmArrived = nil
+        if not farmTarget then return end
+    end
+
+    local goal = farmTarget.Position
+    local delta = goal - myRoot.Position
+    local step = Options.FarmSpeed.Value * dt
+    myRoot.AssemblyLinearVelocity = Vector3.zero
+    if delta.Magnitude <= step then
+        myRoot.CFrame = CFrame.new(goal)
+        farmArrived = farmArrived or os.clock()
+        -- sat on it a full second and the server never marked it: skip it
+        if os.clock() - farmArrived > 1 then
+            skipped[farmTarget] = true
+            farmTarget = nil
+        end
+    else
+        myRoot.CFrame = CFrame.new(myRoot.Position + delta.Unit * step)
+    end
+end
+
+bind(Gameplay:WaitForChild("CoinsStarted").OnClientEvent, function() table.clear(skipped) end)
+
+-- ═══════════════════════════════════════════
+-- ESP
+-- ═══════════════════════════════════════════
+local espFolder = Instance.new("Folder")
+espFolder.Name = HttpService:GenerateGUID(false)
+espFolder.Parent = gethui and gethui() or svc("CoreGui")
+
+local ESP = {} -- [player] = { hl, name, tracer }
+
+local function roleColor(role)
+    if role == "Murderer" then return Options.ColMurderer.Value end
+    if role == "Sheriff" then return Options.ColSheriff.Value end
+    if role == "Hero" then return Options.ColHero.Value end
+    return Options.ColInnocent.Value
+end
+
+local function getESP(plr)
+    local o = ESP[plr]
+    if o then return o end
+    o = {
+        hl = Instance.new("Highlight"),
+        name = Drawing.new("Text"),
+        tracer = Drawing.new("Line"),
+    }
+    o.hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    o.hl.FillTransparency = 0.55
+    o.hl.OutlineTransparency = 0
+    o.hl.Enabled = false
+    o.hl.Parent = espFolder
+    o.name.Size = 14
+    o.name.Center = true
+    o.name.Outline = true
+    o.name.Font = 2
+    o.name.Visible = false
+    o.tracer.Thickness = 1
+    o.tracer.Visible = false
+    ESP[plr] = o
+    return o
+end
+
+local function removeESP(plr)
+    local o = ESP[plr]
+    if not o then return end
+    o.hl:Destroy()
+    o.name:Remove()
+    o.tracer:Remove()
+    ESP[plr] = nil
+end
+
+local gunHL = Instance.new("Highlight")
+gunHL.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+gunHL.FillTransparency = 0.3
+gunHL.Enabled = false
+gunHL.Parent = espFolder
+local gunText = Drawing.new("Text")
+gunText.Size = 14
+gunText.Center = true
+gunText.Outline = true
+gunText.Font = 2
+gunText.Text = "DROPPED GUN"
+gunText.Visible = false
+
+local function updateESP()
+    local cam = workspace.CurrentCamera
+    local vp = cam.ViewportSize
+    local myRoot = rootOf(LP)
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP then
+            local o = getESP(plr)
+            local root = rootOf(plr)
+            local role = root and getRole(plr)
+            local show = Toggles.ESPEnabled.Value and root ~= nil and role ~= nil
+                and (role ~= "Innocent" or Toggles.ESPInnocents.Value)
+
+            if not show then
+                o.hl.Enabled = false
+                o.name.Visible = false
+                o.tracer.Visible = false
+            else
+                local col = roleColor(role)
+
+                o.hl.Adornee = plr.Character
+                o.hl.FillColor = col
+                o.hl.OutlineColor = col
+                o.hl.Enabled = Toggles.ESPChams.Value
+
+                local head = plr.Character:FindFirstChild("Head") or root
+                local sp, onScreen = cam:WorldToViewportPoint(head.Position + Vector3.new(0, 2, 0))
+                if onScreen and (Toggles.ESPNames.Value or Toggles.ESPDistance.Value) then
+                    local parts = {}
+                    if Toggles.ESPNames.Value then parts[#parts + 1] = ("%s [%s]"):format(plr.DisplayName, role) end
+                    if Toggles.ESPDistance.Value and myRoot then
+                        parts[#parts + 1] = ("%dm"):format(math.floor((root.Position - myRoot.Position).Magnitude + 0.5))
+                    end
+                    o.name.Text = table.concat(parts, "  ")
+                    o.name.Color = col
+                    o.name.Position = Vector2.new(sp.X, sp.Y)
+                    o.name.Visible = true
+                else
+                    o.name.Visible = false
+                end
+
+                local rp, rootOnScreen = cam:WorldToViewportPoint(root.Position)
+                if Toggles.ESPTracers.Value and rootOnScreen then
+                    o.tracer.From = Vector2.new(vp.X / 2, vp.Y)
+                    o.tracer.To = Vector2.new(rp.X, rp.Y)
+                    o.tracer.Color = col
+                    o.tracer.Visible = true
+                else
+                    o.tracer.Visible = false
+                end
+            end
+        end
+    end
+
+    -- dropped gun
+    local drop = Toggles.GunESP.Value and findGunDrop()
+    if drop then
+        gunHL.Adornee = drop
+        gunHL.FillColor = Options.ColGun.Value
+        gunHL.OutlineColor = Options.ColGun.Value
+        gunHL.Enabled = true
+        local sp, onScreen = cam:WorldToViewportPoint(drop.Position + Vector3.new(0, 1.5, 0))
+        gunText.Position = Vector2.new(sp.X, sp.Y)
+        gunText.Color = Options.ColGun.Value
+        gunText.Visible = onScreen
+    else
+        gunHL.Enabled = false
+        gunText.Visible = false
+    end
+end
+
+bind(Players.PlayerRemoving, removeESP)
+
+-- ═══════════════════════════════════════════
+-- PLAYER
+-- ═══════════════════════════════════════════
+local speedApplied, jumpApplied = false, false
+
+local function updatePlayer()
+    local char = LP.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+
+    if Toggles.Speed.Value then
+        hum.WalkSpeed = Options.SpeedValue.Value
+        speedApplied = true
+    elseif speedApplied then
+        hum.WalkSpeed = DEFAULT_WALKSPEED
+        speedApplied = false
+    end
+
+    if Toggles.Jump.Value then
+        hum.UseJumpPower = true
+        hum.JumpPower = Options.JumpValue.Value
+        jumpApplied = true
+    elseif jumpApplied then
+        hum.JumpPower = DEFAULT_JUMPPOWER
+        jumpApplied = false
+    end
+end
+
+bind(UIS.JumpRequest, function()
+    if not (Running and Toggles.InfJump.Value) then return end
+    local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health > 0 then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+end)
+
+bind(RunService.Stepped, function()
+    if not Running then return end
+    if not (Toggles.Noclip.Value or Toggles.CoinFarm.Value) then return end
+    local char = LP.Character
+    if not char then return end
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") then p.CanCollide = false end
+    end
+end)
+
+bind(LP.Idled, function()
+    if Running and Toggles.AntiAFK.Value then
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.zero)
+    end
+end)
+
+-- ═══════════════════════════════════════════
+-- MAIN LOOPS
+-- ═══════════════════════════════════════════
+bind(RunService.RenderStepped, function()
+    if not Running then return end
+    updateESP()
+end)
+
+bind(RunService.Heartbeat, function(dt)
+    if not Running then return end
+    updatePlayer()
+    updateKillAura()
+    updateCoinFarm(dt)
+end)
+
+-- status: what this executor can actually do
+do
+    local lines = {}
+    if not firetouchinterest then lines[#lines + 1] = "knife aura: unavailable (no firetouchinterest)" end
+    lines[#lines + 1] = "silent aim: WeaponService patched (confirm with one test shot)"
+    hookStatus:SetText(table.concat(lines, "\n"))
+end
+
+-- ═══════════════════════════════════════════
+-- UNLOAD
+-- ═══════════════════════════════════════════
+Library:OnUnload(function()
+    Running = false
+    for _, c in ipairs(Conns) do c:Disconnect() end
+
+    WeaponService.GetMouseTargetCFrame = origGetMouseTargetCFrame
+    WeaponService.GetTargetPosition = origGetTargetPosition
+
+    for plr in pairs(ESP) do removeESP(plr) end
+    gunText:Remove()
+    espFolder:Destroy()
+
+    local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+    if hum then
+        if speedApplied then hum.WalkSpeed = DEFAULT_WALKSPEED end
+        if jumpApplied then hum.JumpPower = DEFAULT_JUMPPOWER end
+    end
+
+    G.__mana_mm2_unload = nil
+end)
+
+G.__mana_mm2_unload = function() Library:Unload() end
+
+-- ═══════════════════════════════════════════
+-- CONFIG / THEMES
+-- ═══════════════════════════════════════════
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+ThemeManager:SetFolder("ManaMM2")
+SaveManager:SetFolder("ManaMM2/MM2")
+SaveManager:BuildConfigSection(Tabs["UI Settings"])
+ThemeManager:ApplyToTab(Tabs["UI Settings"])
+SaveManager:LoadAutoloadConfig()
+
+Library:Notify({ Title = "MANA MM2", Description = "loaded. RightShift toggles the menu.", Time = 4 })
